@@ -1,0 +1,130 @@
+name: Signed macOS release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version to publish
+        required: true
+        default: 0.1.0
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    env:
+      CI: "true"
+      TARGET_ARCH: ${{ matrix.arch }}
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+      NATIVE_DEPS_PREFIX: ${{ github.workspace }}/.native-deps/${{ matrix.arch }}
+      SIGNING_IDENTITY: "Developer ID Application: Mathieu Gagnon (RJL9XWBZ9L)"
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.12.0
+          cache: npm
+      - name: Confirm requested version
+        run: test "$(node -p "require('./package.json').version")" = "${{ inputs.version }}"
+      - name: Install build tools
+        run: brew install pkg-config
+      - run: npm ci
+      - name: Import Developer ID certificate
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          KEYCHAIN_PATH="$RUNNER_TEMP/release-signing.keychain-db"
+          CERTIFICATE_PATH="$RUNNER_TEMP/developer-id.p12"
+          printf '%s' "$CERTIFICATE_P12_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -k "$KEYCHAIN_PATH" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          ORIGINAL_KEYCHAINS=()
+          while IFS= read -r keychain; do
+            keychain="${keychain//\"/}"
+            if [[ -n "$keychain" ]]; then ORIGINAL_KEYCHAINS+=("$keychain"); fi
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$KEYCHAIN_PATH" "${ORIGINAL_KEYCHAINS[@]}"
+          echo "RELEASE_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+      - run: npm run check:public-source
+      - run: npm audit --omit=dev --audit-level=high
+      - name: Build, sign, notarize, and verify DMG
+        run: npm run release:mac -- ${{ matrix.arch }}
+      - name: Smoke test packaged helper and native app launch
+        run: |
+          APP_PATH="$(find "release/${{ matrix.arch }}" -maxdepth 3 -type d -name 'Android File Transfer for macOS.app' -print -quit)"
+          test -n "$APP_PATH"
+          bash scripts/smoke-packaged-app.sh "$APP_PATH" "${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-dmg-${{ matrix.arch }}
+          path: release/assets/*.dmg
+          if-no-files-found: error
+      - name: Remove temporary signing keychain
+        if: always()
+        run: |
+          if [[ -n "${RELEASE_KEYCHAIN:-}" ]]; then security delete-keychain "$RELEASE_KEYCHAIN" || true; fi
+          rm -f "$RUNNER_TEMP/developer-id.p12"
+
+  publish:
+    needs: build
+    runs-on: macos-15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: v${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.12.0
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: signed-dmg-*
+          path: release/assets
+          merge-multiple: true
+      - run: npm run release:sources -- ${{ inputs.version }}
+      - run: bash scripts/create-checksums.sh release/assets
+      - name: Verify collected artifacts
+        run: |
+          bash scripts/verify-macos-release.sh release/assets/Android-File-Transfer-for-macOS-${{ inputs.version }}-arm64.dmg arm64
+          bash scripts/verify-macos-release.sh release/assets/Android-File-Transfer-for-macOS-${{ inputs.version }}-x64.dmg x64
+          (cd release/assets && shasum -a 256 -c SHA256SUMS.txt)
+      - name: Create or update draft release
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            test "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = "true"
+            gh release upload "$TAG" release/assets/* --clobber
+          else
+            gh release create "$TAG" release/assets/* --draft --prerelease --target "$GITHUB_SHA" --title "$TAG" --notes-file docs/release-notes-v0.1.0.md
+          fi
+      - name: Download and independently reverify release assets
+        run: |
+          rm -rf .tmp/release-download
+          mkdir -p .tmp/release-download
+          gh release download "$TAG" --dir .tmp/release-download
+          (cd .tmp/release-download && shasum -a 256 -c SHA256SUMS.txt)
+          bash scripts/verify-macos-release.sh .tmp/release-download/Android-File-Transfer-for-macOS-${{ inputs.version }}-arm64.dmg arm64
+          bash scripts/verify-macos-release.sh .tmp/release-download/Android-File-Transfer-for-macOS-${{ inputs.version }}-x64.dmg x64
+      - name: Publish as a pre-release
+        run: gh release edit "$TAG" --draft=false --prerelease=true
