@@ -97,7 +97,7 @@ assert.match(app, /connectionPhase: 'opening'[\s\S]*will keep trying automatical
 assert.doesNotMatch(app, /connectionAttemptCounts/);
 assert.match(app, /window\.mtp\.cancelConnectionAttempt\(\)/);
 assert.match(app, /inventory\?\.connectionPhase === 'ready'[\s\S]*status\?\.sessionOpen === true/);
-assert.match(app, /!hasDevice \? \([\s\S]*className="connection-gate"/);
+assert.match(app, /!hasDevice \? \([\s\S]*className=.{0,2}connection-gate/);
 assert.match(app, /keeps checking on its own for as long as the cable is in/);
 assert.doesNotMatch(app, /recoverWithAdmin|Mac login password|osascript|protected access/i);
 
@@ -113,6 +113,12 @@ const policy = await import(policyUrl);
 
 assert.equal(policy.MTP_CONNECTION_WATCHDOG_MS, 10_000);
 assert.equal(policy.LIBMTP_OPEN_SESSION_TIMEOUT_MS, 5_000);
+assert.equal(
+  policy.classifyMtpConnectionIssue(new policy.MtpUsbBusyError('User-facing explanation'), 'PTP_ERROR_IO: canceled'),
+  'other-app-owns-usb',
+  'Observed ownership must stay USB-busy regardless of wording or stale helper errors, so automatic retries continue.'
+);
+assert.match(main, /throw new MtpUsbBusyError\(blockedMtpAccessMessage\(\)\)/);
 assert.equal(
   policy.classifyMtpConnectionIssue(new Error('PTP_ERROR_IO: failed to open session'), ''),
   'phone-not-responding',

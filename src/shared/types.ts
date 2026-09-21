@@ -66,6 +66,28 @@ export interface DeviceStatus {
   // Name of the Mac app holding a macOS Image Capture session on the phone
   // (for example Preview). Present only while that app keeps the phone busy.
   usbOwnerApp?: string;
+  usbConflict?: UsbConflict;
+}
+
+export interface UsbConflictApp {
+  id: string;
+  name: string;
+  quitImpact: string;
+}
+
+export interface UsbConflict {
+  connectionId: string;
+  apps: UsbConflictApp[];
+}
+
+export interface QuitUsbAppRequest {
+  connectionId: string;
+  appId: string;
+}
+
+export interface QuitUsbAppResult {
+  ok: boolean;
+  message: string;
 }
 
 export interface MtpStorage {
@@ -479,6 +501,7 @@ export type AppMenuCommand =
 
 export interface MtpApi {
   getStatus: () => Promise<DeviceStatus>;
+  requestQuitUsbApp: (request: QuitUsbAppRequest) => Promise<QuitUsbAppResult>;
   scanInventory: () => Promise<InventoryResult>;
   listFolder: (
     deviceIndex: number,

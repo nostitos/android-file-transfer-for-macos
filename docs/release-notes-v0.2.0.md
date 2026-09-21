@@ -18,7 +18,7 @@ The second public pre-release. It adds phone and Mac file management, explicit s
 - The waiting screen no longer rewrites itself while the app rechecks the phone. A background recheck used to swap the heading between "Connected. Reading phone storage..." and "Waiting for your phone to share its files..." about twice a second.
 - A phone left on Charging / No data transfer is now described accurately. Samsung devices still expose an MTP interface in that mode, so the session opens but no storage is ever shared; the app now says to choose File transfer instead of suggesting a prompt that never appears.
 - The storage question is repeated at most every two seconds instead of on every 400 ms USB check, and repeated identical log lines are summarized every 30 seconds.
-- When a Mac app holds the phone through macOS Image Capture, the app names it. `ptpcamerad` reconnects on that app's behalf and resets the phone each time, which stops the phone answering anyone; the gate now reads "Quit <app> to free your phone" instead of retrying silently.
+- When macOS camera import owns the phone, the app names a verified active client and keeps the USB-busy message stable. It waits for that client to release the phone instead of repeatedly terminating the camera daemon. No external processes are terminated automatically. An explicit normal-Quit action explains its effects and respects save prompts or refusal.
 
 Both DMGs and their contained apps are Developer ID signed, Apple-notarized, stapled, and independently checked after upload. Verify downloads with `SHA256SUMS.txt`.
 

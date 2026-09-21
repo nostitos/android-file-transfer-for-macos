@@ -2623,3 +2623,26 @@ button {
     grid-template-columns: 1fr;
   }
 }
+
+.usb-conflict { width: min(640px, 100%); }
+.connection-gate-copy .usb-conflict-assurance { font-size: 14px; color: var(--ink); }
+.usb-conflict-wait { margin-top: 20px; padding: 10px 28px; min-height: 40px; }
+.usb-conflict-apps { margin-top: 26px; text-align: left; }
+.usb-conflict-app {
+  padding: 18px 20px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-strong);
+}
+.usb-conflict-app + .usb-conflict-app { margin-top: 10px; }
+.usb-conflict-app h2 { margin: 0; font-size: 16px; font-weight: 650; color: var(--ink); }
+.connection-gate-copy .usb-conflict-evidence { margin-top: 3px; font-size: 12px; }
+.connection-gate-copy .usb-conflict-impact { margin-top: 12px; font-size: 14px; }
+.usb-conflict-quit { margin-top: 14px; padding: 8px 12px; min-height: 36px; }
+.connection-gate-copy .usb-conflict-footnote,
+.connection-gate-copy .usb-conflict-unknown { font-size: 13px; line-height: 1.5; }
+.connection-gate-copy .usb-conflict-feedback { min-height: 40px; margin-top: 16px; font-size: 13px; }
+.connection-gate.has-usb-conflict { padding: 24px; justify-content: safe center; }
+.has-usb-conflict .connection-gate-icon { width: 52px; height: 52px; }
+.has-usb-conflict .connection-gate-copy { margin-top: 16px; }
+.has-usb-conflict .connection-gate-copy h1 { font-size: 26px; }

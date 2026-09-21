@@ -3,7 +3,12 @@ import type { MtpConnectionIssue, MtpConnectionPhase } from '../shared/types';
 export const LIBMTP_OPEN_SESSION_TIMEOUT_MS = 5_000;
 export const MTP_CONNECTION_WATCHDOG_MS = 10_000;
 
+// Ownership was observed before opening the helper. Do not infer this result
+// from user-facing wording or stderr left over from an earlier session.
+export class MtpUsbBusyError extends Error {}
+
 export function classifyMtpConnectionIssue(error: unknown, stderr: string): MtpConnectionIssue {
+  if (error instanceof MtpUsbBusyError) return 'other-app-owns-usb';
   const rawMessage = error instanceof Error ? error.message : String(error);
   const combined = `${rawMessage}\n${stderr}`.toLowerCase();
   if (combined.includes('canceled') || combined.includes('cancelled') || combined.includes('stopped by user')) {

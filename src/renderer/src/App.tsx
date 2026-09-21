@@ -1,3 +1,4 @@
+import { UsbConflictPanel } from './UsbConflictPanel';
 import {
   AlertTriangle,
   ArrowLeft,
@@ -93,6 +94,7 @@ const CONNECTED_PHONE_CHECK_INTERVAL_MS = 3000;
 // MTP round trip twice a second for as long as the cable is in, so the storage
 // retry runs on its own slower clock while USB attachment checks stay fast.
 const SHARED_STORAGE_RETRY_INTERVAL_MS = 2000;
+const BUSY_PHONE_RETRY_INTERVAL_MS = 5000;
 const THEME_STORAGE_KEY = 'androidFileTransferForMacOS.themeMode';
 const PHONE_VIEW_MODE_STORAGE_KEY = 'androidFileTransferForMacOS.phoneViewMode';
 const MAC_VIEW_MODE_STORAGE_KEY = 'androidFileTransferForMacOS.macViewMode';
@@ -1258,7 +1260,7 @@ export function App(): JSX.Element {
     !!status?.sessionOpen &&
     inventory?.connectionIssue === 'storage-unavailable' &&
     reportedPhase !== 'needs-replug';
-  const scanBusyForDisplay = isScanning && !awaitingSharedStorage;
+  const scanBusyForDisplay = isScanning && !awaitingSharedStorage && reportedPhase !== 'usb-busy';
   const connectionPhase: MtpConnectionPhase = scanBusyForDisplay
     ? status?.sessionOpen
       ? 'listing-storage'
@@ -1294,10 +1296,12 @@ export function App(): JSX.Element {
   const fileSessionOpen = !!status?.sessionOpen;
   const storageFailure = fileSessionOpen && inventory?.connectionIssue === 'storage-unavailable';
   const storageAccessWait = awaitingSharedStorage;
-  // A Mac app (Preview, Photos, Image Capture) holding an Image Capture session
-  // keeps macOS reconnecting to the phone and resetting it, so the phone never
-  // answers. The main process names that app; showing it beats "still trying".
-  const usbOwnerApp = hasDevice ? undefined : inventory?.usbOwnerApp ?? status?.usbOwnerApp;
+  // Status is refreshed independently; an old failed inventory must not keep
+  // naming an app after that app has quit or the USB attachment has changed.
+  const usbOwnerApp = hasDevice ? undefined : status?.usbOwnerApp;
+  const usbConflict = hasDevice ? undefined : status?.usbConflict;
+  const usbBlocked = !!rawDevice && !fileTransferInactive &&
+    (connectionPhase === 'usb-busy' || !!usbConflict);
   const currentFolderName = location.crumbs[location.crumbs.length - 1]?.label ?? 'folder';
   const macDestinationLabel = folderLabelForPath(localPath || destination);
   const phoneDestinationLabel = location.storageId === null ? 'Phone folder' : currentFolderName;
@@ -1385,7 +1389,7 @@ export function App(): JSX.Element {
         detail: fileSessionDone
           ? 'The phone-file session is open.'
           : usbOwnerApp
-            ? `Quit ${usbOwnerApp}; it is holding the phone through macOS Image Capture.`
+            ? `${usbOwnerApp} is an active camera-import client. Waiting for the connection.`
           : connectionPhase === 'opening'
             ? 'Trying to open the phone file connection.'
             : connectionPhase === 'needs-mode-reset'
@@ -1665,19 +1669,13 @@ export function App(): JSX.Element {
       // The helper is already open; keep asking only for storage on that session.
       return nextInventory;
     }
-    if (
-      nextInventory.ok ||
-      (nextInventory.connectionIssue !== 'phone-not-responding' &&
-        nextInventory.connectionIssue !== 'other-app-owns-usb')
-    ) {
+    if (nextInventory.ok || nextInventory.connectionIssue !== 'phone-not-responding') {
       return nextInventory;
     }
     return {
       ...nextInventory,
       connectionPhase: 'opening',
-      message: nextInventory.connectionIssue === 'other-app-owns-usb'
-        ? 'macOS briefly used the phone connection. The app will keep trying automatically.'
-        : 'The phone has not answered yet. The app will keep trying automatically.'
+      message: 'The phone has not answered yet. The app will keep trying automatically.'
     };
   }
 
@@ -1765,9 +1763,9 @@ export function App(): JSX.Element {
           nextInventory.connectionPhase !== 'needs-replug' &&
           manualStatus?.sessionOpen === true;
         const openingStillPending =
-          nextInventory.connectionPhase === 'opening' &&
-          (nextInventory.connectionIssue === 'phone-not-responding' ||
-            nextInventory.connectionIssue === 'other-app-owns-usb');
+          nextInventory.connectionIssue === 'other-app-owns-usb' ||
+          (nextInventory.connectionPhase === 'opening' &&
+            nextInventory.connectionIssue === 'phone-not-responding');
         if (nextInventory.connectionPhase !== 'cancelled' && !storageStillPending && !openingStillPending) {
           rememberAutomaticScanFailure(nextStatus);
         }
@@ -1900,6 +1898,11 @@ export function App(): JSX.Element {
         currentInventory?.connectionIssue === 'storage-unavailable';
 
       if (needsInventory) {
+        if (
+          rawKey === lastAutoRawKey.current &&
+          currentInventory?.connectionIssue === 'other-app-owns-usb' &&
+          Date.now() - lastScanFinishedAt.current < BUSY_PHONE_RETRY_INTERVAL_MS
+        ) return;
         if (
           repeatingStorageQuestion &&
           Date.now() - lastScanFinishedAt.current < SHARED_STORAGE_RETRY_INTERVAL_MS
@@ -4834,7 +4837,7 @@ export function App(): JSX.Element {
       : queueSummary.queuedTransfers
       ? 'Transfer queued'
       : usbOwnerApp
-        ? `Quit ${usbOwnerApp}`
+        ? 'USB in use'
       : awaitingSharedStorage
         ? 'Waiting for phone'
       : scanBusyForDisplay
@@ -4851,7 +4854,7 @@ export function App(): JSX.Element {
       : queueSummary.queuedTransfers
       ? 'Files are queued and will copy when the current phone operation finishes.'
       : usbOwnerApp
-        ? `${usbOwnerApp} is using the phone through macOS Image Capture. Quit ${usbOwnerApp} and the app will connect on its own.`
+        ? `${usbOwnerApp} is an active camera-import client. The app is waiting for the phone connection to become available.`
       : awaitingSharedStorage
         ? 'The phone file session is open, but the phone has not shared its files yet. Choose File transfer on the phone.'
       : scanBusyForDisplay
@@ -4928,7 +4931,7 @@ export function App(): JSX.Element {
             role="status"
             aria-live="polite"
           >
-            {isScanning || queueActive || connectionPhase === 'opening' || connectionPhase === 'listing-storage'
+            {scanBusyForDisplay || queueActive || connectionPhase === 'opening' || connectionPhase === 'listing-storage'
               ? <Loader2 size={14} className="spin" />
               : <Circle size={10} fill="currentColor" />}
             <span>{connectionLabel}</span>
@@ -4937,9 +4940,9 @@ export function App(): JSX.Element {
       </section>
 
       {!hasDevice ? (
-        <section className="connection-gate" role="status" aria-live="polite">
+        <section className={`connection-gate ${usbBlocked ? 'has-usb-conflict' : ''}`} role="status" aria-live="polite">
           <div className={`connection-gate-icon state-${connectionStateClass}`} aria-hidden="true">
-            {isScanning || storageAccessWait || connectionPhase === 'opening' || connectionPhase === 'listing-storage' ? (
+            {scanBusyForDisplay || storageAccessWait || connectionPhase === 'opening' || connectionPhase === 'listing-storage' ? (
               usbOwnerApp ? <AlertTriangle size={34} /> : <Loader2 size={34} className="spin" />
             ) : cannotOpenPhone ? (
               <AlertTriangle size={34} />
@@ -4948,14 +4951,20 @@ export function App(): JSX.Element {
             )}
           </div>
 
+          {usbBlocked ? (
+            <UsbConflictPanel
+              key={usbConflict?.connectionId ?? rawDevice?.connectionId ?? 'usb-busy'}
+              phoneName={rawDeviceName}
+              conflict={usbConflict}
+              requestQuit={window.mtp.requestQuitUsbApp}
+            />
+          ) : (
           <div className="connection-gate-copy">
             <h1>
               {!rawDevice
                 ? isScanning ? 'Looking for your phone...' : 'Connect your Android phone'
                 : connectionPhase === 'file-transfer-off'
                   ? 'Choose File transfer on your phone'
-                  : usbOwnerApp
-                    ? `Quit ${usbOwnerApp} to free your phone`
                   : connectionPhase === 'opening'
                     ? connectionIssue
                       ? 'Still trying to connect to your phone...'
@@ -4968,8 +4977,6 @@ export function App(): JSX.Element {
                         ? 'Reset File transfer on your phone'
                         : connectionPhase === 'needs-replug'
                           ? 'Your phone stopped responding'
-                          : connectionPhase === 'usb-busy'
-                            ? 'Close the app using your phone'
                             : connectionPhase === 'cancelled'
                               ? 'Opening was canceled'
                               : 'Opening your phone files...'}
@@ -4981,23 +4988,11 @@ export function App(): JSX.Element {
                 Swipe down on the phone, tap the USB notification, then choose <strong>File transfer</strong>.
                 Keep the phone unlocked; this app will continue automatically.
               </p>
-            ) : usbOwnerApp ? (
-              <p>
-                <strong>{usbOwnerApp}</strong> is holding {rawDeviceName} through macOS Image Capture. Each time it
-                reconnects, the phone is reset, so nothing else can open it. Quit {usbOwnerApp}; this app will
-                connect on its own. If the phone is still silent 15 seconds later, switch its USB mode to{' '}
-                <strong>Charging</strong> and back to <strong>File transfer</strong> so it starts answering again.
-              </p>
             ) : storageAccessWait ? (
               <p>
                 {rawDeviceName} is connected, but it has not shared any files yet. Unlock the phone, swipe down,
                 tap the USB notification, and choose <strong>File transfer</strong>; tap <strong>Allow</strong>{' '}
                 if Android asks. The app keeps checking on its own for as long as the cable is in.
-              </p>
-            ) : connectionPhase === 'opening' && connectionIssue === 'other-app-owns-usb' ? (
-              <p>
-                macOS briefly used the phone connection first. Keep {rawDeviceName} unlocked and in <strong>File
-                transfer</strong>. The app keeps trying automatically; you do not need to press anything here.
               </p>
             ) : connectionPhase === 'opening' && connectionIssue === 'phone-not-responding' ? (
               <p>
@@ -5016,8 +5011,6 @@ export function App(): JSX.Element {
                 reconnect it, unlock the phone, and choose <strong>File transfer</strong>. The app will try again
                 automatically.
               </p>
-            ) : connectionPhase === 'usb-busy' ? (
-              <p>Close Photos, Image Capture, and other Android transfer apps, then try again.</p>
             ) : connectionPhase === 'cancelled' ? (
               <p>The phone was not changed. Press Retry when you are ready.</p>
             ) : connectionPhase === 'listing-storage' ? (
@@ -5053,8 +5046,9 @@ export function App(): JSX.Element {
               </p>
             ) : null}
           </div>
+          )}
 
-          {(isScanning || storageAccessWait || connectionPhase === 'opening' || connectionPhase === 'listing-storage') &&
+          {!usbBlocked && (scanBusyForDisplay || storageAccessWait || connectionPhase === 'opening' || connectionPhase === 'listing-storage') &&
           rawDevice?.connectionMode === 'mtp' ? (
             <button
               className="text-button connection-gate-primary"
@@ -5064,7 +5058,7 @@ export function App(): JSX.Element {
               <X size={18} />
               <span>Cancel</span>
             </button>
-          ) : shouldShowRetry ? (
+          ) : !usbBlocked && shouldShowRetry ? (
             <button
               className="primary-button connection-gate-primary"
               type="button"

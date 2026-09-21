@@ -510,11 +510,39 @@ Napi::Value AtomicExchangePaths(const Napi::CallbackInfo& info) {
   return env.Undefined();
 }
 
+Napi::Value RequestApplicationQuit(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (info.Length() != 2 || !info[0].IsString() || !info[1].IsString()) {
+    Napi::TypeError::New(env, "requestApplicationQuit requires a bundle ID and bundle path")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  @autoreleasepool {
+    NSString* bundleId = [NSString stringWithUTF8String:info[0].As<Napi::String>().Utf8Value().c_str()];
+    NSString* bundlePath = [NSString stringWithUTF8String:info[1].As<Napi::String>().Utf8Value().c_str()];
+    NSArray<NSRunningApplication*>* apps = [NSRunningApplication runningApplicationsWithBundleIdentifier:bundleId];
+    NSMutableArray<NSRunningApplication*>* matches = [NSMutableArray array];
+    for (NSRunningApplication* candidate in apps) {
+      if (!candidate.terminated && [candidate.bundleURL.path isEqualToString:bundlePath]) {
+        [matches addObject:candidate];
+      }
+    }
+    if (matches.count == 0) return Napi::String::New(env, "not-running");
+    if (matches.count != 1 || matches[0].processIdentifier == getpid()) {
+      return Napi::String::New(env, "refused");
+    }
+    // Normal Quit delivers the app's usual termination request. It may show
+    // save dialogs or refuse. Never escalate to forceTerminate or a signal.
+    return Napi::String::New(env, [matches[0] terminate] ? "requested" : "refused");
+  }
+}
+
 Napi::Object Initialize(Napi::Env env, Napi::Object exports) {
   exports.Set("startDrag", Napi::Function::New(env, StartDrag));
   exports.Set("completePromise", Napi::Function::New(env, CompletePromise));
   exports.Set("failAll", Napi::Function::New(env, FailAll));
   exports.Set("atomicExchangePaths", Napi::Function::New(env, AtomicExchangePaths));
+  exports.Set("requestApplicationQuit", Napi::Function::New(env, RequestApplicationQuit));
   return exports;
 }
 

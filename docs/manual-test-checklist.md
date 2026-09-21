@@ -142,15 +142,15 @@ For the authorized Pixel 9 test device `4B090DLAQ00062`, record `adb shell svc u
 
 Some Android devices remain visible to IOKit in File Transfer mode while OpenSession returns `PTP_ERROR_IO`. Treat this as **phone did not answer**, never as readable storage or a macOS permission problem.
 
-- With `ptpcamerad` shown as the selected phone's `UsbExclusiveOwner`, launch the app. Confirm the bounded same-user camera handoff either opens one session or reports USB busy within ten seconds.
-- Confirm another process or a `ptpcamerad` instance owned by a different user is not terminated.
+- With `ptpcamerad` shown as the selected phone's `UsbExclusiveOwner`, launch the app. Confirm it explains the conflict and waits without terminating the daemon or any client app.
+- Confirm no camera-service process is terminated, regardless of its owner or whether a client was identified.
 - Confirm `mtp-json status` can still report the raw Android USB interface without opening a file session.
 - Confirm a failed open keeps the browser hidden, shows **Still trying to open your phone files...**, and does not invoke a password prompt or USB reset.
 - Confirm the log shows sequential bounded helper attempts for that attachment, with at most one helper owning the phone at a time.
 - Confirm the screen explains that the app is trying automatically and does not ask the user to press Retry or reconnect while File Transfer remains visible.
 - On Samsung, switch to File transfer and let the app open its session before tapping Allow. Confirm the screen says **Waiting for your phone to share its files...** with a spinner and no Retry button, the helper stays open, and the file browser appears on its own within a few seconds of tapping Allow, with no second Android prompt. Wait well past two minutes before tapping Allow on a second run and confirm the app is still waiting rather than showing a reconnect screen.
 - Leave a Samsung on **Charging** / **No data transfer** with the cable in. The phone still enumerates as 04e8:6860 with an MTP interface, so the session opens but never returns storage. Confirm the heading, spinner, and status pill (**Waiting for phone**) hold still for at least 30 seconds with no text swapping, the copy tells you to choose File transfer on the phone, an extra line naming Charging / No data transfer appears after about 12 seconds, and the log shows the storage answer about every two seconds at most with a repeat summary instead of a line pair every half second. Then switch the phone to File transfer and confirm the browser appears without a click.
-- Open Preview (no document needed) and leave it running, then connect the phone in File transfer. Confirm the log shows `released macOS camera import ownership` followed by `Preview (com.apple.Preview) holds a macOS Image Capture session`, the heading changes to **Quit Preview to free your phone** with the pill **Quit Preview**, and no "switch USB to Charging" advice is shown. Quit Preview and confirm the file browser appears without a click and the log says Preview no longer blocks the phone.
+- With a camera-import client such as Google Drive owning the phone through `ptpcamerad`, confirm the app shows a stable USB-busy message and names the client only when its PID, executable, and the phone's USB location match. Leave it for a minute: the daemon must not be killed on each check. Quit the client and confirm the label clears, retries resume automatically, and a readable phone opens. Do not deliberately recreate this conflict on a user's active phone; use a dedicated test device.
 - Unplug and replug the phone, then take your time before switching it to File transfer. Confirm the log shows `phone re-enumerated on USB` followed by a fresh session open on the new connection, and that the file browser appears without any click.
 - Confirm raw bus/address label churn within the same USB session does not start another helper.
 - Confirm a changed USB session ID clears stale inventory, folder errors, and automatic-open blocking.
@@ -166,3 +166,12 @@ npm run mtp:smoke -- --timeout-ms=300000 --min-size=10000000
 
 - Do not require folder Move. Existing items must remain protected from silent or unverified replacement.
 - Do not require Wi-Fi, cloud sync, adb, or an Android companion app.
+
+## Respectful USB conflict recovery
+
+- On a dedicated test device, verify Keep waiting leaves all apps running while checks continue automatically.
+- A verified Google Drive client must show the sync and cloud-only-file impact before Request Google Drive to quit. Other clients must explain possible imports and unsaved work.
+- Click Request Quit in a controlled fixture. The app should receive its normal macOS Quit request and can show a save prompt or decline. The transfer app must never escalate to force-quit, and must report delivery rather than claim the other app has exited.
+- Change the USB attachment, camera-service PID, or client process before clicking an old Quit offer. Nothing should be closed.
+- An unidentified owner offers waiting and manual guidance without a guessed Quit target.
+- Verify the busy message stays stable during polling and normal file access resumes when the connection is free.

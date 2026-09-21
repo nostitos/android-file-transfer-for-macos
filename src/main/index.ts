@@ -38,10 +38,11 @@ import { createRequire } from 'node:module';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { androidUsbFallbackKey, parseAndroidUsbDevicesFromIoreg } from './androidUsb';
-import { findMacMtpCameraOwner } from './macMtpCamera';
+import { findMacMtpCameraOwner, findMacCameraClients, cameraProcessAgeSeconds, MacCameraConflicts, type MacMtpCameraOwner, type MacCameraConflictSnapshot } from './macMtpCamera';
 import {
   classifyMtpConnectionIssue,
   connectionPhaseForIssue,
+  MtpUsbBusyError,
   MTP_CONNECTION_WATCHDOG_MS
 } from './mtpConnectionPolicy';
 import {
@@ -61,6 +62,7 @@ import { normalizeSemanticVersion, selectLatestRelease, type ReleaseCandidate } 
 import { keepBothPhoneName, temporaryPhoneTransferName } from '../shared/transferCollision';
 import type {
   AppMenuCommand,
+  QuitUsbAppRequest,
   AppUpdateCheckResult,
   CommonMacFolder,
   CreateLocalFolderRequest,
@@ -151,6 +153,7 @@ interface NativePromiseDragEvent {
 }
 
 interface FilePromiseDragAddon {
+  requestApplicationQuit: (bundleId: string, bundlePath: string) => 'requested' | 'not-running' | 'refused';
   startDrag: (
     options: {
       viewHandle: Buffer;
@@ -255,6 +258,7 @@ interface LegacyPrivilegedSessionManifest {
 }
 
 let mtpSessionTeardown: Promise<void> | null = null;
+let connectionAttemptGeneration = 0;
 
 function getLogPath(): string {
   const logsDir = join(app.getPath('userData'), 'logs');
@@ -445,186 +449,84 @@ function readMacMtpInterfaces(): Promise<string> {
   });
 }
 
-function verifiedUserCameraProcess(pid: number): boolean {
-  try {
-    const output = execFileSync('/bin/ps', ['-p', String(pid), '-o', 'uid=', '-o', 'comm='], {
-      encoding: 'utf8',
-      timeout: 1000,
-      maxBuffer: 16 * 1024
-    }).trim();
-    const match = output.match(/^(\d+)\s+(.+)$/);
-    const currentUid = process.getuid?.();
-    return !!match &&
-      currentUid !== undefined &&
-      Number.parseInt(match[1], 10) === currentUid &&
-      basename(match[2].trim()) === 'ptpcamerad';
-  } catch {
-    return false;
-  }
-}
+const cameraConflicts = new MacCameraConflicts(randomUUID);
 
-const CAMERA_OWNER_RELEASE_DEADLINE_MS = 1500;
-const CAMERA_OWNER_RELEASE_POLL_MS = 100;
-
-// ptpcamerad only runs while some Mac app holds an Image Capture device
-// session. When it comes straight back after a release, that client app is
-// the real owner of the phone: each of its reconnects resets the phone, so the
-// phone never answers anyone. The unified log names the client, so the app
-// can tell the user exactly which app to quit instead of "still trying".
-const MAC_CAMERA_CLIENT_LOG_WINDOW = '45s';
-const MAC_CAMERA_CLIENT_DETECT_INTERVAL_MS = 20_000;
-const MAC_CAMERA_CLIENT_TTL_MS = 3 * 60_000;
-const MAC_CAMERA_RELAUNCH_WINDOW_MS = 2 * 60_000;
-const MAC_CAMERA_CLIENT_NAMES: Record<string, string> = {
-  'com.apple.Preview': 'Preview',
-  'com.apple.Photos': 'Photos',
-  'com.apple.Image_Capture': 'Image Capture',
-  'com.apple.iBooksX': 'Books',
-  'com.apple.PhotoBooth': 'Photo Booth'
-};
-let macCameraClient: { bundleId: string; appName: string; detectedAt: number } | null = null;
-let macCameraClientDetection: Promise<void> | null = null;
-let lastMacCameraClientDetectAt = 0;
-let lastReleasedCameraOwner: { pid: number; at: number } | null = null;
-
-function macCameraClientAppName(bundleId: string): string {
-  const known = MAC_CAMERA_CLIENT_NAMES[bundleId];
-  if (known) {
-    return known;
-  }
-  const tail = bundleId.split('.').pop() || bundleId;
-  return tail.replace(/[_-]+/g, ' ');
+function currentUsbConflict() {
+  return lastRawDevices.map((device) => cameraConflicts.get(rawDeviceConnectionId(device))).find(Boolean);
 }
 
 function currentMacCameraClientApp(): string | undefined {
-  if (!macCameraClient || Date.now() - macCameraClient.detectedAt > MAC_CAMERA_CLIENT_TTL_MS) {
-    return undefined;
-  }
-  return macCameraClient.appName;
+  return currentUsbConflict()?.apps.map((entry) => entry.name).join(', ') || undefined;
 }
 
-function clearMacCameraClient(reason: string): void {
-  if (macCameraClient) {
-    appendLog(`${macCameraClient.appName} no longer blocks the phone (${reason})`);
-  }
-  macCameraClient = null;
-  lastReleasedCameraOwner = null;
-}
-
-function detectMacCameraClient(trigger: string): Promise<void> {
-  if (process.platform !== 'darwin') {
-    return Promise.resolve();
-  }
-  if (macCameraClientDetection) {
-    return macCameraClientDetection;
-  }
-  const now = Date.now();
-  if (now - lastMacCameraClientDetectAt < MAC_CAMERA_CLIENT_DETECT_INTERVAL_MS) {
-    return Promise.resolve();
-  }
-  lastMacCameraClientDetectAt = now;
-
-  macCameraClientDetection = new Promise<void>((resolvePromise) => {
-    execFile(
-      '/usr/bin/log',
-      [
-        'show',
-        '--last',
-        MAC_CAMERA_CLIENT_LOG_WINDOW,
-        '--style',
-        'compact',
-        '--predicate',
-        'process == "ptpcamerad"'
-      ],
-      { maxBuffer: 1024 * 1024 * 32, timeout: 8000 },
-      (error, stdout) => {
-        macCameraClientDetection = null;
-        if (error) {
-          appendLog(`macOS camera client lookup failed (${trigger}): ${error.message}`);
-          resolvePromise();
-          return;
-        }
-        let bundleId: string | null = null;
-        const pattern = /requestStart \| Process: ([A-Za-z0-9._-]+)/g;
-        for (let match = pattern.exec(stdout); match; match = pattern.exec(stdout)) {
-          bundleId = match[1];
-        }
-        if (!bundleId) {
-          appendLog(`macOS camera import is active but no client app was named in the last ${MAC_CAMERA_CLIENT_LOG_WINDOW} (${trigger})`);
-          if (macCameraClient) {
-            clearMacCameraClient('no client app named in the recent camera import log');
-          }
-          resolvePromise();
-          return;
-        }
-        const appName = macCameraClientAppName(bundleId);
-        if (macCameraClient?.bundleId !== bundleId) {
-          appendLog(
-            `${appName} (${bundleId}) holds a macOS Image Capture session on the phone; every reconnect resets the phone, so it will not answer until ${appName} is quit (${trigger})`
-          );
-        }
-        macCameraClient = { bundleId, appName, detectedAt: Date.now() };
-        resolvePromise();
-      }
-    );
+async function readMacCameraClients(owner: MacMtpCameraOwner) {
+  // Clients register once, often long before this app is opened. Limit history
+  // to this daemon's lifetime so an old registration stays usable without
+  // attributing records from an earlier process that happened to share its PID.
+  const age = cameraProcessAgeSeconds(execFileSync('/bin/ps', ['-p', String(owner.pid), '-o', 'etime='], {
+    encoding: 'utf8', timeout: 1000, maxBuffer: 1024
+  }));
+  if (age === null) return [];
+  const log = await new Promise<string>((resolvePromise) => {
+    execFile('/usr/bin/log', [
+      'show', '--last', `${age + 1}s`, '--style', 'compact',
+      '--predicate', `processID == ${owner.pid} AND process == "ptpcamerad" AND (eventMessage CONTAINS "PTPCameraDevice" OR eventMessage CONTAINS "requestStart" OR eventMessage CONTAINS "requestStop")`
+    ], { timeout: 3000, maxBuffer: 4 * 1024 * 1024 }, (error, stdout) => {
+      resolvePromise(error ? '' : stdout);
+    });
   });
-  return macCameraClientDetection;
+  const processes = new Map<number, string>();
+  const output = execFileSync('/bin/ps', ['-axo', 'pid=', '-o', 'uid=', '-o', 'comm='], {
+    encoding: 'utf8', timeout: 1000, maxBuffer: 1024 * 1024
+  });
+  for (const line of output.split('\n')) {
+    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(.+)$/);
+    if (match && Number(match[2]) === process.getuid?.()) {
+      processes.set(Number(match[1]), match[3]);
+    }
+  }
+  return findMacCameraClients(log, owner, processes);
 }
 
-// One bounded, scoped handoff: release the verified same-user ptpcamerad owner of
-// this exact phone interface and wait for the kernel to drop the exclusive claim.
-// No USB reset and no unbounded kill loop; if macOS reclaims first, the bounded
-// connection attempt reports that the USB interface is busy.
-async function releaseMacMtpCameraOwnerAndWait(rawDevice: RawDevice): Promise<boolean> {
-  const deadline = Date.now() + CAMERA_OWNER_RELEASE_DEADLINE_MS;
-  let releasedPid: number | null = null;
+async function inspectMacCameraConflict(rawDevice: RawDevice): Promise<MacCameraConflictSnapshot | null> {
+  const output = await readMacMtpInterfaces();
+  if (!output.trim()) throw new Error('Unable to check the phone USB interface owner.');
+  const owner = findMacMtpCameraOwner(output, rawDevice);
+  if (!owner) return null;
+  const clients = await readMacCameraClients(owner);
+  // Logs can be slow. An ownership change invalidates the old client list.
+  const current = findMacMtpCameraOwner(await readMacMtpInterfaces(), rawDevice);
+  if (!current) return null;
+  return { owner: current, clients: current.pid === owner.pid && current.locationId === owner.locationId ? clients : [] };
+}
 
-  for (;;) {
-    const ioregOutput = await readMacMtpInterfaces();
-    const owner = ioregOutput ? findMacMtpCameraOwner(ioregOutput, rawDevice) : null;
-    if (!owner) {
-      if (macCameraClient && releasedPid === null) {
-        // Nobody was holding the interface on this attempt, so the named app
-        // has let go; stop telling the user to quit it.
-        clearMacCameraClient('macOS camera import is no longer holding the phone');
-      }
-      return true;
-    }
-
-    if (!verifiedUserCameraProcess(owner.pid)) {
-      return false;
-    }
-
-    if (owner.pid !== releasedPid) {
-      const relaunchedSinceLastRelease =
-        !!lastReleasedCameraOwner &&
-        lastReleasedCameraOwner.pid !== owner.pid &&
-        Date.now() - lastReleasedCameraOwner.at < MAC_CAMERA_RELAUNCH_WINDOW_MS;
-      if (relaunchedSinceLastRelease) {
-        void detectMacCameraClient('ptpcamerad relaunched after release');
-      }
-      try {
-        process.kill(owner.pid, 'SIGKILL');
-        releasedPid = owner.pid;
-        lastReleasedCameraOwner = { pid: owner.pid, at: Date.now() };
-        appendLog(
-          `released macOS camera import ownership of MTP interface for ${rawDeviceConnectionId(rawDevice)} (pid ${owner.pid})`
-        );
-      } catch (error) {
-        const nodeError = error as NodeJS.ErrnoException;
-        if (nodeError.code !== 'ESRCH') {
-          appendLog(`unable to release macOS camera import ownership: ${nodeError.message || String(error)}`);
-          return false;
-        }
-      }
-    }
-
-    if (Date.now() >= deadline) {
-      return false;
-    }
-
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, CAMERA_OWNER_RELEASE_POLL_MS));
+async function checkMacMtpCameraAccess(rawDevice: RawDevice, generation: number): Promise<boolean> {
+  const connectionId = rawDeviceConnectionId(rawDevice);
+  const conflict = await inspectMacCameraConflict(rawDevice);
+  if (generation !== connectionAttemptGeneration) throw new Error('Opening phone files was canceled.');
+  cameraConflicts.observe(connectionId, conflict);
+  if (conflict) {
+    appendThrottledLog(`USB interface busy for ${connectionId}; waiting for the camera-import service to release it. No process was terminated.`);
   }
+  return !conflict;
+}
+
+async function requestQuitUsbApp(request: QuitUsbAppRequest) {
+  return cameraConflicts.requestQuit(request, {
+    inspect: async (connectionId) => {
+      await refreshRawDevices();
+      if (sessionConnectionId === connectionId) return null;
+      const rawDevice = lastRawDevices.find((entry) => rawDeviceConnectionId(entry) === connectionId);
+      if (!rawDevice) return null;
+      return inspectMacCameraConflict(rawDevice);
+    },
+    quitNormally: (client) => {
+      const addon = loadFilePromiseDragAddon();
+      if (!addon?.requestApplicationQuit) return 'refused';
+      appendLog(`user requested normal Quit for ${client.appName} to release the phone`);
+      return addon.requestApplicationQuit(client.bundleId, client.bundlePath);
+    }
+  });
 }
 
 function bridgeFailureHint(stderr: string, timedOut: boolean): string | null {
@@ -1025,7 +927,7 @@ function getRawKeyForDeviceIndex(deviceIndex: number): string | null {
 }
 
 function blockedMtpAccessMessage(): string {
-  return 'Another Mac app is using the phone USB connection. Close Photos, Image Capture, and other Android transfer apps, then try again.';
+  return 'Another Mac app is using the phone USB connection. Waiting for it to become available; see the connection panel for options. Nothing will be closed automatically.';
 }
 
 function sessionErrorMessage(base: string, error: unknown, stderr: string): string {
@@ -1107,6 +1009,7 @@ function cancelFolderListing(): boolean {
 }
 
 function cancelConnectionAttempt(): boolean {
+  connectionAttemptGeneration += 1;
   if (!sessionProcess || sessionConnectionId) {
     return cancelFolderListing();
   }
@@ -1334,7 +1237,7 @@ function handleSessionPayload(payload: SessionPayload): void {
       sessionReadyResolve?.();
       sessionReadyResolve = null;
       sessionReadyReject = null;
-      clearMacCameraClient('the phone answered and the MTP session opened');
+      if (sessionConnectionId) cameraConflicts.observe(sessionConnectionId, null);
       mainWindow?.webContents.send('mtp:connection-phase', {
         phase: 'listing-storage',
         connectionId: sessionConnectionId ?? undefined
@@ -1414,6 +1317,7 @@ function pumpSessionQueue(): void {
 }
 
 async function ensureMtpSession(deviceIndex: number, expectedConnectionId?: string): Promise<void> {
+  const generation = connectionAttemptGeneration;
   await waitForMtpSessionTeardown();
   const helperPath = await ensureBridge();
 
@@ -1453,12 +1357,21 @@ async function ensureMtpSession(deviceIndex: number, expectedConnectionId?: stri
     await destroyMtpSession('Restarting MTP session for a different phone connection.', true);
   }
 
-  if (!(await releaseMacMtpCameraOwnerAndWait(rawDevice))) {
+  if (!(await checkMacMtpCameraAccess(rawDevice, generation))) {
     appendLog(
       `macOS camera import still owns the MTP interface for ${connectionId}; the bounded connection attempt stopped without resetting the phone USB session`
     );
-    throw new Error(blockedMtpAccessMessage());
+    throw new MtpUsbBusyError(blockedMtpAccessMessage());
   }
+
+  if (generation !== connectionAttemptGeneration) throw new Error('Opening phone files was canceled.');
+  await refreshRawDevices();
+  rawDevice = rawDeviceForConnection(deviceIndex, connectionId);
+  if (!rawDevice) throw new Error('The phone re-established its USB connection while checking USB ownership.');
+  if (generation !== connectionAttemptGeneration) throw new Error('Opening phone files was canceled.');
+  deviceIndex = rawDevice.index;
+  deviceIdentityKey = rawDeviceIdentityKey(rawDevice);
+  rawKey = rawDeviceKey(rawDevice);
 
   sessionStdoutBuffer = '';
   sessionStderrBuffer = '';
@@ -1685,6 +1598,7 @@ async function getStatus(): Promise<DeviceStatus> {
 
   const currentKeys = new Set(lastRawDevices.map((device) => rawDeviceKey(device)));
   const currentConnectionIds = new Set(lastRawDevices.map(rawDeviceConnectionId));
+  cameraConflicts.retainConnections(currentConnectionIds);
   const currentDeviceIdentityKeys = new Set(lastRawDevices.map(rawDeviceIdentityKey));
   if (currentKeys.size > 0) {
     rawDevicesMissingSince = null;
@@ -1773,7 +1687,8 @@ async function getStatus(): Promise<DeviceStatus> {
     sessionOpen: normalSessionOpen,
     sessionConnectionId: sessionConnectionId ?? undefined,
     sessionConnectionIds: sessionConnectionId ? [sessionConnectionId] : [],
-    usbOwnerApp: normalSessionOpen ? undefined : currentMacCameraClientApp()
+    usbOwnerApp: normalSessionOpen ? undefined : currentMacCameraClientApp(),
+    usbConflict: normalSessionOpen ? undefined : currentUsbConflict()
   };
 }
 
@@ -2231,23 +2146,12 @@ async function scanInventory(): Promise<InventoryResult> {
     } catch (error) {
       const stderr = lastSessionStderr;
       connectionIssue = classifyMtpConnectionIssue(error, stderr);
-      // A claim refusal, or a phone that stops answering right after macOS
-      // camera import was released, both point at a Mac app that keeps
-      // reconnecting through ptpcamerad. Find out which one.
-      if (
-        connectionIssue === 'other-app-owns-usb' ||
-        (connectionIssue === 'phone-not-responding' &&
-          !!lastReleasedCameraOwner &&
-          Date.now() - lastReleasedCameraOwner.at < MAC_CAMERA_RELAUNCH_WINDOW_MS)
-      ) {
-        void detectMacCameraClient(`inventory failed with ${connectionIssue}`);
-      }
       const message = sessionErrorMessage(
         `Unable to open ${rawDevice.vendor || rawDevice.product || 'the phone'}.`,
         error,
         stderr ?? ''
       );
-      appendLog(`inventory failed for ${connectionId}: ${message}`);
+      appendThrottledLog(`inventory failed for ${connectionId}: ${message}${stderr?.trim() ? ` (${limitDiagnosticText(stderr, 600)})` : ''}`);
       failures.push(message);
       if (stderr?.trim()) {
         stderrParts.push(stderr.trim());
@@ -2298,7 +2202,7 @@ async function scanInventory(): Promise<InventoryResult> {
       connectionPhase: connectionPhaseForIssue(finalIssue),
       connectionIssue: finalIssue,
       message: usbOwnerApp
-        ? `${usbOwnerApp} is using the phone through macOS Image Capture. Quit ${usbOwnerApp}; the app will connect on its own.`
+        ? `${usbOwnerApp} is an active camera-import client. Waiting for the phone connection; see the connection panel for options.`
         : sessionErrorMessage(fallback.message, combinedMessage || fallback.message, stderrParts.join('\n')),
       usbOwnerApp
     },
@@ -4873,6 +4777,7 @@ app.whenReady().then(() => {
       listFolder(deviceIndex, deviceConnectionId, storageId, parentId)
   );
   ipcMain.handle('mtp:cancelConnectionAttempt', () => cancelConnectionAttempt());
+  ipcMain.handle('mtp:requestQuitUsbApp', (_event, request: QuitUsbAppRequest) => requestQuitUsbApp(request));
   ipcMain.handle('mtp:cancelFolderListing', () => cancelFolderListing());
   ipcMain.handle('local:listDirectory', (_event, directoryPath?: string, showHiddenFiles?: boolean) =>
     listLocalDirectory(directoryPath, showHiddenFiles === true)

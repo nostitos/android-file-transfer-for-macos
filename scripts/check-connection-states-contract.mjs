@@ -39,7 +39,7 @@ assert.match(
 );
 assert.match(app, /keeps checking on its own for as long as the cable is in/);
 assert.match(app, /openingStillPending[\s\S]*!openingStillPending\) \{[\s\S]*rememberAutomaticScanFailure/);
-assert.match(app, /Close the app using your phone/);
+assert.match(app, /<UsbConflictPanel/);
 assert.match(app, /Opening was canceled/);
 assert.match(app, /tap <strong>Allow<\/strong> if Android asks/);
 assert.match(app, /className="primary-button connection-gate-primary"[\s\S]*<span>Try again<\/span>/);
@@ -54,7 +54,7 @@ assert.match(
 );
 assert.match(
   app,
-  /!hasDevice \? \([\s\S]*className="connection-gate"[\s\S]*\) : \([\s\S]*className=\{`workspace/,
+  /!hasDevice \? \([\s\S]*className=.{0,2}connection-gate[\s\S]*\) : \([\s\S]*className=\{`workspace/,
   'The file browser must stay hidden until the phone is ready.'
 );
 assert.match(app, /showDiagnostics && \([\s\S]*className="connection-gate-details"/);
@@ -64,7 +64,8 @@ assert.match(app, /automaticScanBlocked\(nextStatus\)/);
 assert.match(app, /rememberAutomaticScanFailure\(nextStatus\)/);
 assert.match(app, /lastVisibleConnectionKey\.current !== nextConnectionKey/);
 assert.match(app, /lastVisibleMode\.current !== nextMode/);
-assert.match(app, /connectionIssue !== 'phone-not-responding'[\s\S]*connectionIssue !== 'other-app-owns-usb'/);
+assert.match(app, /nextInventory\.ok \|\| nextInventory\.connectionIssue !== 'phone-not-responding'/,
+  'A busy USB interface must retain its actual result instead of becoming an opening attempt.');
 assert.match(app, /connectionPhase: 'opening'/);
 assert.match(app, /keeps trying automatically; you do not need to\s+reconnect or press Retry/);
 assert.doesNotMatch(app, /connectionAttemptCounts/);
