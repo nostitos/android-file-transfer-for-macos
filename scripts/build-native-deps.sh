@@ -6,6 +6,7 @@ ARCH="${1:-${TARGET_ARCH:-$(uname -m)}}"
 DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
 LIBUSB_VERSION="1.0.30"
 LIBMTP_VERSION="1.1.23"
+LIBMTP_PATCH="$ROOT/patches/libmtp-1.1.23-no-usb-reset.patch"
 LIBUSB_SHA256="fea36f34f9156400209595e300840767ab1a385ede1dc7ee893015aea9c6dbaf"
 LIBMTP_SHA256="74a2b6e8cb4a0304e95b995496ea3ac644c29371649b892b856e22f12a0bdeed"
 CACHE_DIR="${NATIVE_DEPS_CACHE_DIR:-$ROOT/.cache/native-deps}"
@@ -53,6 +54,12 @@ download_and_verify \
 
 tar -xjf "$LIBUSB_ARCHIVE" -C "$WORK_DIR"
 tar -xzf "$LIBMTP_ARCHIVE" -C "$WORK_DIR"
+
+if [[ ! -f "$LIBMTP_PATCH" ]]; then
+  echo "Required libmtp patch is missing: $LIBMTP_PATCH" >&2
+  exit 1
+fi
+patch -d "$WORK_DIR/libmtp-$LIBMTP_VERSION" -p1 < "$LIBMTP_PATCH"
 
 export MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET"
 export CFLAGS="${CFLAGS:-} -arch $CLANG_ARCH -mmacosx-version-min=$DEPLOYMENT_TARGET"

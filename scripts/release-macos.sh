@@ -5,8 +5,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ARCH="${1:?Usage: release-macos.sh arm64|x64}"
 VERSION="$(node -p "require('$ROOT/package.json').version")"
 PRODUCT_NAME="Android File Transfer for macOS"
-SIGNING_IDENTITY="${SIGNING_IDENTITY:-Developer ID Application: Mathieu Gagnon (RJL9XWBZ9L)}"
-CSC_CERTIFICATE_NAME="${CSC_CERTIFICATE_NAME:-Mathieu Gagnon (RJL9XWBZ9L)}"
+SIGNING_IDENTITY="${SIGNING_IDENTITY:?Set SIGNING_IDENTITY to the exact Developer ID Application identity.}"
+CSC_CERTIFICATE_NAME="${CSC_CERTIFICATE_NAME:?Set CSC_CERTIFICATE_NAME to the certificate name electron-builder must select.}"
+EXPECTED_TEAM_ID="${EXPECTED_TEAM_ID:?Set EXPECTED_TEAM_ID to the signing certificate Apple Developer Team ID.}"
 OUTPUT_ROOT="$ROOT/release/$ARCH"
 ASSET_DIR="${RELEASE_ASSET_DIR:-$ROOT/release/assets}"
 
@@ -26,10 +27,8 @@ elif [[ -n "${APPLE_KEYCHAIN_PROFILE:-}" ]]; then
   if [[ -n "${APPLE_KEYCHAIN:-}" ]]; then
     NOTARY_AUTH+=(--keychain "$APPLE_KEYCHAIN")
   fi
-elif [[ "${CI:-false}" != "true" ]]; then
-  NOTARY_AUTH=(--keychain-profile TilePilot --keychain "$HOME/Library/Keychains/login.keychain-db")
 else
-  echo "Apple notarization credentials are not configured." >&2
+  echo "Apple notarization credentials are not configured. Set APPLE_API_KEY, APPLE_API_KEY_ID, and APPLE_API_ISSUER; APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, and APPLE_TEAM_ID; or APPLE_KEYCHAIN_PROFILE." >&2
   exit 1
 fi
 
@@ -75,5 +74,5 @@ xcrun stapler validate "$DMG_PATH"
 
 FINAL_DMG="$ASSET_DIR/$(basename "$DMG_PATH")"
 cp "$DMG_PATH" "$FINAL_DMG"
-"$ROOT/scripts/verify-macos-release.sh" "$FINAL_DMG" "$ARCH"
+"$ROOT/scripts/verify-macos-release.sh" "$FINAL_DMG" "$ARCH" "$VERSION"
 echo "$FINAL_DMG"

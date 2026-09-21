@@ -48,6 +48,18 @@ node -e '
   }
 ' "$STATUS_FILE"
 
+if ! "$EXECUTABLE" --disable-gpu --file-promise-smoke > "$LOG_DIR/addon-stdout.log" 2> "$LOG_DIR/addon-stderr.log"; then
+  echo "Packaged file-promise addon failed to load in the signed Electron host." >&2
+  sed -n '1,80p' "$LOG_DIR/addon-stderr.log" >&2
+  exit 1
+fi
+if ! grep -q '^PACKAGED_FILE_PROMISE_DRAG_OK$' "$LOG_DIR/addon-stdout.log"; then
+  echo "Packaged file-promise addon smoke test returned no success marker." >&2
+  sed -n '1,80p' "$LOG_DIR/addon-stdout.log" >&2
+  sed -n '1,80p' "$LOG_DIR/addon-stderr.log" >&2
+  exit 1
+fi
+
 "$EXECUTABLE" --disable-gpu > "$LOG_DIR/stdout.log" 2> "$LOG_DIR/stderr.log" &
 APP_PID=$!
 sleep 5
@@ -57,4 +69,4 @@ if ! kill -0 "$APP_PID" >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Packaged $ARCH helper and app launch smoke test passed on $(uname -m)."
+echo "Packaged $ARCH helper, file-promise addon, and app launch smoke test passed on $(uname -m)."

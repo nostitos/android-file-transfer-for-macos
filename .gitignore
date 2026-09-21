@@ -17,6 +17,8 @@ transfer-test/
 .native-deps/
 src/node_modules/
 src/native/file-promise-drag/build/
+graphify-out/
+/index.js
 *.p12
 *.p8
 *.keychain-db

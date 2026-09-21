@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readdirSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
@@ -7,11 +7,19 @@ const args = process.argv.slice(2);
 const rootIndex = args.indexOf('--root');
 const archIndex = args.indexOf('--arch');
 const maxIndex = args.indexOf('--max-macos');
+const allowBuildPaths = args.includes('--allow-build-paths');
 assert.ok(rootIndex >= 0 && args[rootIndex + 1], 'Usage: check-macho.mjs --root PATH --arch arm64|x64 [--max-macos 12.0]');
 
 const root = resolve(args[rootIndex + 1]);
-const expectedArch = (archIndex >= 0 ? args[archIndex + 1] : process.arch) === 'x64' ? 'x86_64' : args[archIndex + 1];
+assert.ok(existsSync(root), `Mach-O validation root does not exist: ${root}`);
+const requestedArch = archIndex >= 0 ? args[archIndex + 1] : process.arch;
+assert.ok(
+  requestedArch === 'arm64' || requestedArch === 'x64' || requestedArch === 'x86_64',
+  `Unsupported Mach-O architecture: ${requestedArch}`
+);
+const expectedArch = requestedArch === 'x64' ? 'x86_64' : requestedArch;
 const maximumMacOS = maxIndex >= 0 ? args[maxIndex + 1] : '12.0';
+assert.match(maximumMacOS, /^\d+(?:\.\d+){0,2}$/, `Invalid maximum macOS version: ${maximumMacOS}`);
 
 function run(command, commandArgs) {
   const result = spawnSync(command, commandArgs, { encoding: 'utf8' });
@@ -64,6 +72,7 @@ for (const path of machOFiles) {
     ...loadCommands.matchAll(/\bminos\s+([0-9.]+)/g),
     ...loadCommands.matchAll(/\bversion\s+([0-9.]+)\n\s+sdk/g)
   ].map((match) => match[1]);
+  assert.ok(minimumVersions.length > 0, `${path} does not declare a macOS deployment target`);
 
   for (const minimumVersion of minimumVersions) {
     assert.ok(
@@ -72,8 +81,10 @@ for (const path of machOFiles) {
     );
   }
 
-  const links = run('otool', ['-m', '-L', path]);
-  assert.doesNotMatch(links, /\/opt\/homebrew|\/usr\/local|\.native-deps/, `${path} has a non-portable runtime dependency`);
+  if (!allowBuildPaths) {
+    const links = run('otool', ['-m', '-L', path]);
+    assert.doesNotMatch(links, /\/opt\/homebrew|\/usr\/local|\.native-deps/, `${path} has a non-portable runtime dependency`);
+  }
 }
 
 console.log(`Verified ${machOFiles.length} Mach-O files for ${expectedArch} and macOS ${maximumMacOS}+ compatibility.`);

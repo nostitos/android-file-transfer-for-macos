@@ -61,14 +61,40 @@ assert.match(
   'A phone source must be removed only after the atomic Mac destination is published.'
 );
 assert.match(main, /job\.sourceRemovalStatus = 'kept'/);
-assert.match(main, /enqueueDownloads\(requests, 'move'\)/);
-assert.match(main, /enqueueUploads\(requests, 'move'\)/);
+const removeMoveSourceBlock = main.match(
+  /async function removeMoveSource\([\s\S]*?(?=\nasync function runTransferJob)/
+)?.[0];
+assert.ok(removeMoveSourceBlock, 'Move source cleanup implementation must remain present.');
+assert.match(removeMoveSourceBlock, /phoneFileMutationTarget\(job, job\.objectId, job\.name, job\.modified\)/);
+assert.match(removeMoveSourceBlock, /runTransferPhoneMutation\([\s\S]*'delete-item'[\s\S]*sourceTarget/);
+assert.doesNotMatch(
+  removeMoveSourceBlock,
+  /runSessionCommand[\s\S]*['"]delete['"]/,
+  'Move-to-Mac cleanup must never use the legacy object-id-only delete command.'
+);
+assert.doesNotMatch(native, /static void session_delete\(/, 'The legacy object-id-only delete function must not exist.');
+assert.doesNotMatch(native, /strcmp\(command, "delete"\)/, 'The legacy object-id-only delete command must not exist.');
+assert.match(main, /queueDownloads\(requests, 'move'\)/);
+assert.match(main, /queueUploads\(requests, 'move'\)/);
 
-assert.match(native, /LIBMTP_Get_Filemetadata/);
-assert.match(native, /current->item_id == object_id/);
+const retryTransferBlock = main.match(
+  /function retryTransfer\(jobId: string\): TransferJob \| null \{[\s\S]*?(?=\nfunction cancelTransfer)/
+)?.[0];
+assert.ok(retryTransferBlock, 'Transfer retry implementation must remain present.');
+assert.match(
+  retryTransferBlock,
+  /job\.collisionAction = destination\.renamedDestination \? 'keep-both' : undefined;/
+);
+assert.match(
+  retryTransferBlock,
+  /job\.destinationIdentity = undefined;/,
+  'A Mac Replace retry must discard the stale destination identity after choosing a new path.'
+);
+
+assert.match(native, /verified_phone_mutation_target[\s\S]*LIBMTP_Get_Filemetadata/);
 assert.match(native, /metadata->filesize == expected_size/);
-assert.match(native, /LIBMTP_Delete_Object\(device, object_id\)/);
-assert.match(native, /strcmp\(command, "delete"\) == 0/);
+assert.match(native, /metadata->modificationdate[\s\S]*expected_modified/);
+assert.match(native, /strcmp\(command, "rename-item"\).*strcmp\(command, "delete-item"\)/s);
 
 const phoneBreadcrumbs = cssBlock('.breadcrumbs');
 const localBreadcrumbs = cssBlock('.local-breadcrumbs');

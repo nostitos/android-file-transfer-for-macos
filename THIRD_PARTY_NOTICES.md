@@ -18,6 +18,6 @@ Android File Transfer for macOS bundles the following dynamically linked librari
 
 The complete LGPL 2.1 license text is distributed with the app at `Contents/Resources/licenses/LGPL-2.1.txt` and in this repository at [`licenses/LGPL-2.1.txt`](licenses/LGPL-2.1.txt).
 
-The release asset `THIRD_PARTY_SOURCES-0.1.0.tar.gz` contains the exact upstream source archives, the license text, the public build script, and these notices. The libraries are dynamically linked and stored separately under the app's `Contents/Resources/lib` directory so recipients can inspect or replace them with compatible builds.
+The release asset `THIRD_PARTY_SOURCES-0.2.0.tar.gz` contains the exact upstream source archives, the license text, the public build script, and these notices. The libraries are dynamically linked and stored separately under the app's `Contents/Resources/lib` directory so recipients can inspect or replace them with compatible builds.
 
 The application-specific source in this repository is MIT-licensed. No OpenMTP source files are included.

@@ -48,6 +48,11 @@ assert.match(app, /Promise\.allSettled/, 'Cancel-all must tolerate individual ca
 assert.match(app, /aria-label="Overall transfer progress"/, 'Aggregate queue progress must be exposed as a progressbar.');
 assert.match(app, /Clear Finished/, 'Queue summary must show a clear-finished control.');
 assert.match(app, /Cancel All/, 'Queue summary must show a cancel-all control.');
+assert.match(
+  app,
+  /event\.type === 'completed'[\s\S]*event\.job\.direction === 'download'[\s\S]*event\.job\.destinationDirectory === localPath[\s\S]*loadLocalDirectory\(localPath\)/,
+  'A completed download must refresh the open Mac destination folder.'
+);
 
 assert.match(main, /const knownTotal = job\.size > 0 \? job\.size : job\.totalBytes/, 'Transfer progress must prefer known file sizes.');
 assert.match(main, /Math\.min\(Math\.max\(reportedTransferred, 0\), job\.totalBytes\)/, 'Transfer progress must clamp callback bytes to the known total.');
@@ -58,11 +63,6 @@ assert.match(
   main,
   /payload\.event === 'progress'[\s\S]*armCommandTimer\(command,[\s\S]*destroyMtpSession\(`MTP session command timed out after \$\{command\.timeoutMs\}ms\.`, true\)/,
   'Normal transfer progress must refresh the session command timeout.'
-);
-assert.match(
-  main,
-  /payload\.event === 'progress'[\s\S]*armCommandTimer\(command,[\s\S]*destroyAdminMtpSession\(`Admin MTP command timed out after \$\{command\.timeoutMs\}ms\.`/,
-  'Protected transfer progress must refresh the admin session command timeout.'
 );
 assert.match(main, /TRANSFER_COMMAND_IDLE_TIMEOUT_MS/, 'Transfer jobs must use the transfer idle timeout constant.');
 

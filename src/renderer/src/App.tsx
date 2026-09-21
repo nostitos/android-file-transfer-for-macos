@@ -26,12 +26,13 @@ import {
   Loader2,
   Monitor,
   Moon,
+  Pencil,
   RefreshCcw,
   RotateCcw,
   Search,
-  ShieldCheck,
   Smartphone,
   Sun,
+  Trash2,
   Upload,
   X
 } from 'lucide-react';
@@ -47,18 +48,27 @@ import {
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent
 } from 'react';
+import { validatePhoneItemName } from '../../shared/phoneMutation';
+import { validateLocalItemName } from '../../shared/localMutation';
+import { nextKeepBothPhoneName } from '../../shared/transferCollision';
 import type {
-  AdminRecoveryResult,
   AppMenuCommand,
+  AppUpdateCheckResult,
   CommonMacFolder,
   DeviceStatus,
   FolderListProgress,
   InventoryResult,
   LocalEntry,
+  LocalMutationTarget,
   LocalDirectoryResult,
   MtpDeviceInventory,
+  MtpConnectionIssue,
+  MtpConnectionPhase,
+  MtpConnectionPhaseEvent,
   MtpObject,
   MtpStorage,
+  PhoneMutationTarget,
+  TransferCollisionAction,
   TransferJob,
   TransferOperation,
   TransferRequest,
@@ -70,14 +80,29 @@ const MAX_PLANNED_PHONE_FILES = 3000;
 const MAX_PLANNED_MAC_FILES = 3000;
 const MAX_PLANNED_MAC_FOLDERS = 1000;
 const MAX_PLANNED_MAC_DEPTH = 100;
-const AUTO_PHONE_CHECK_INTERVAL_MS = 3000;
+const WAITING_PHONE_CHECK_INTERVAL_MS = 400;
+const CONNECTED_PHONE_CHECK_INTERVAL_MS = 3000;
+// A phone that answered the MTP session but has not yet returned storage is
+// still finishing its own File transfer setup or waiting on an Android
+// "Allow access" tap. The session stays open, so the storage question is
+// cheap and safe to repeat for as long as the cable is in; the phone is never
+// reopened or re-prompted by it. There is deliberately no attempt cap: the
+// wait ends only when storage appears, the phone is unplugged, or the user
+// cancels.
+// Repeating that question at the 400 ms USB cadence, however, means a fresh
+// MTP round trip twice a second for as long as the cable is in, so the storage
+// retry runs on its own slower clock while USB attachment checks stay fast.
+const SHARED_STORAGE_RETRY_INTERVAL_MS = 2000;
 const THEME_STORAGE_KEY = 'androidFileTransferForMacOS.themeMode';
-const VIEW_MODE_STORAGE_KEY = 'androidFileTransferForMacOS.phoneViewMode';
-const SHOW_HIDDEN_STORAGE_KEY = 'androidFileTransferForMacOS.showHiddenFiles';
+const PHONE_VIEW_MODE_STORAGE_KEY = 'androidFileTransferForMacOS.phoneViewMode';
+const MAC_VIEW_MODE_STORAGE_KEY = 'androidFileTransferForMacOS.macViewMode';
+const PHONE_SHOW_HIDDEN_STORAGE_KEY = 'androidFileTransferForMacOS.phoneShowHiddenFiles';
+const MAC_SHOW_HIDDEN_STORAGE_KEY = 'androidFileTransferForMacOS.macShowHiddenFiles';
+const LEGACY_SHOW_HIDDEN_STORAGE_KEY = 'androidFileTransferForMacOS.showHiddenFiles';
 const MAC_PANE_WIDTH_STORAGE_KEY = 'androidFileTransferForMacOS.macPaneWidth';
-const BLOCKED_AUTO_DEVICE_KEYS_STORAGE_KEY = 'androidFileTransferForMacOS.blockedAutoDeviceKeys';
-const NORMAL_ACCESS_BLOCKED_MESSAGE =
-  'Phone is visible in File Transfer mode, but its folders are not open yet. Use Open files to start one protected phone-file session.';
+const UPDATE_LAST_CHECK_STORAGE_KEY = 'androidFileTransferForMacOS.lastUpdateCheckAt';
+const AUTO_UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const AUTO_UPDATE_START_DELAY_MS = 6000;
 const DEFAULT_MAC_PANE_WIDTH = 460;
 const MIN_MAC_PANE_WIDTH = 400;
 const MAX_MAC_PANE_WIDTH = 720;
@@ -93,7 +118,7 @@ type RefreshFeedbackPhase = 'checking' | 'done' | 'failed';
 type TransferNoticePhase = 'ready' | 'queued' | 'failed';
 type ActivePane = 'phone' | 'mac';
 type ThemeMode = 'system' | 'light' | 'dark';
-type PhoneViewMode = 'list' | 'grid';
+type FileViewMode = 'list' | 'grid';
 type ContextMenuPane = 'phone' | 'mac';
 type ConnectionStageState = 'done' | 'current' | 'blocked' | 'waiting';
 type TransferClipboard =
@@ -184,6 +209,10 @@ interface ContextMenuState {
   localPath?: string;
 }
 
+type LocalNameDialog =
+  | { mode: 'new-folder' }
+  | { mode: 'rename'; target: LocalEntry };
+
 const rootLocation: BrowserLocation = {
   storageId: null,
   folderId: ROOT_PARENT_ID,
@@ -269,10 +298,26 @@ function summarizeLocalSelection(entries: LocalEntry[]): string {
   return parts.join(' · ');
 }
 
-function uploadSkipSummary(conflictCount: number): string {
-  return conflictCount > 0
-    ? `${conflictCount} name conflict${conflictCount === 1 ? '' : 's'} skipped. Nothing was overwritten.`
-    : '';
+function collisionActionSummary(
+  action: TransferCollisionAction,
+  conflictCount: number,
+  skippedCount: number,
+  incompatibleCount = 0
+): string {
+  const parts: string[] = [];
+  if (conflictCount > 0) {
+    if (action === 'keep-both') {
+      parts.push(`${conflictCount} ${conflictCount === 1 ? 'copy gets' : 'copies get'} a numbered name`);
+    } else if (action === 'replace') {
+      parts.push(`${conflictCount} existing ${conflictCount === 1 ? 'file will be' : 'files will be'} replaced after verification`);
+    } else if (action === 'skip') {
+      parts.push(`${skippedCount} existing ${skippedCount === 1 ? 'item was' : 'items were'} skipped`);
+    }
+  }
+  if (incompatibleCount > 0) {
+    parts.push(`${incompatibleCount} file/folder name ${incompatibleCount === 1 ? 'mismatch was' : 'mismatches were'} skipped`);
+  }
+  return parts.length ? `${parts.join('. ')}.` : '';
 }
 
 function fileNameFromPath(filePath: string): string {
@@ -492,18 +537,22 @@ function systemPrefersDarkTheme(): boolean {
   return window.matchMedia?.('(prefers-color-scheme: dark)').matches ?? false;
 }
 
-function readStoredPhoneViewMode(): PhoneViewMode {
+function readStoredViewMode(storageKey: string): FileViewMode {
   try {
-    const stored = window.localStorage.getItem(VIEW_MODE_STORAGE_KEY);
+    const stored = window.localStorage.getItem(storageKey);
     return stored === 'grid' || stored === 'list' ? stored : 'list';
   } catch {
     return 'list';
   }
 }
 
-function readStoredShowHiddenFiles(): boolean {
+function readStoredShowHiddenFiles(storageKey: string): boolean {
   try {
-    return window.localStorage.getItem(SHOW_HIDDEN_STORAGE_KEY) === 'true';
+    const stored = window.localStorage.getItem(storageKey);
+    if (stored !== null) {
+      return stored === 'true';
+    }
+    return window.localStorage.getItem(LEGACY_SHOW_HIDDEN_STORAGE_KEY) === 'true';
   } catch {
     return false;
   }
@@ -580,38 +629,6 @@ function rawDeviceKey(
   return `${rawDevice.bus}:${rawDevice.device}:${rawDevice.vendorId}:${rawDevice.productId}`;
 }
 
-function rawDeviceIdentityKey(
-  rawDevice: DeviceStatus['rawDevices'][number] | null | undefined
-): string | null {
-  if (!rawDevice) {
-    return null;
-  }
-
-  return [
-    rawDevice.vendorId,
-    rawDevice.productId,
-    rawDevice.serial?.toLowerCase() ?? '',
-    rawDevice.vendor.toLowerCase(),
-    rawDevice.product.toLowerCase(),
-    rawDevice.connectionMode ?? 'unknown'
-  ].join(':');
-}
-
-function rawDeviceAutomaticIdentityKey(
-  rawDevice: DeviceStatus['rawDevices'][number] | null | undefined
-): string | null {
-  if (!rawDevice) {
-    return null;
-  }
-
-  return [
-    rawDevice.vendorId,
-    rawDevice.productId,
-    rawDevice.serial?.toLowerCase() ?? '',
-    rawDevice.connectionMode ?? 'unknown'
-  ].join(':');
-}
-
 function rawDeviceStableIdentityKey(
   rawDevice: DeviceStatus['rawDevices'][number] | null | undefined
 ): string | null {
@@ -620,6 +637,28 @@ function rawDeviceStableIdentityKey(
   }
 
   return [rawDevice.vendorId, rawDevice.productId, rawDevice.serial?.toLowerCase() ?? ''].join(':');
+}
+
+function inventoryDeviceStableIdentityKey(device: MtpDeviceInventory): string {
+  return [device.vendorId, device.productId, device.serial?.toLowerCase() ?? ''].join(':');
+}
+
+function inventoryRepresentsVisibleMtpDevices(
+  nextStatus: DeviceStatus,
+  currentInventory: InventoryResult
+): boolean {
+  const inventoryIdentityKeys = new Set(
+    currentInventory.devices.map(inventoryDeviceStableIdentityKey)
+  );
+  const visibleIdentityKeys = nextStatus.rawDevices
+    .filter((candidate) => candidate.connectionMode !== 'usb-only')
+    .map(rawDeviceStableIdentityKey)
+    .filter((candidate): candidate is string => !!candidate);
+
+  return (
+    visibleIdentityKeys.length > 0 &&
+    visibleIdentityKeys.every((identityKey) => inventoryIdentityKeys.has(identityKey))
+  );
 }
 
 function rawDeviceConnectionKey(
@@ -638,32 +677,6 @@ function rawDeviceConnectionKey(
     ? `usb-session:${rawDevice.usbSessionId}`
     : `raw:${rawDeviceKey(rawDevice) ?? 'unknown'}`;
   return `${stableKey}:${usbSessionKey}`;
-}
-
-function rawDeviceAutomaticBlockKeys(
-  rawDevice: DeviceStatus['rawDevices'][number] | null | undefined
-): string[] {
-  if (!rawDevice) {
-    return [];
-  }
-
-  return Array.from(
-    new Set(
-      [
-        rawDeviceIdentityKey(rawDevice),
-        rawDeviceAutomaticIdentityKey(rawDevice),
-        `${rawDevice.vendorId}:${rawDevice.productId}:${rawDevice.connectionMode ?? 'unknown'}`
-      ].filter((key): key is string => typeof key === 'string' && key.length > 0)
-    )
-  );
-}
-
-function statusRawKey(nextStatus: DeviceStatus | null): string | null {
-  return rawDeviceKey(nextStatus?.rawDevices[0]);
-}
-
-function statusDeviceIdentityKey(nextStatus: DeviceStatus | null): string | null {
-  return rawDeviceIdentityKey(nextStatus?.rawDevices[0]);
 }
 
 function statusStableDeviceIdentityKey(nextStatus: DeviceStatus | null): string | null {
@@ -689,51 +702,26 @@ function statusSessionConnectionIds(nextStatus: DeviceStatus): Set<string> {
   );
 }
 
-function statusAutomaticBlockKeys(nextStatus: DeviceStatus | null): string[] {
-  return rawDeviceAutomaticBlockKeys(nextStatus?.rawDevices[0]);
-}
-
-function expandBlockedAutoDeviceKeyAliases(key: string): string[] {
-  const parts = key.split(':');
-  if (parts.length >= 6) {
-    const [vendorId, productId, serial] = parts;
-    const mode = parts[parts.length - 1] || 'unknown';
-    return [key, `${vendorId}:${productId}:${serial}:${mode}`, `${vendorId}:${productId}:${mode}`];
-  }
-  if (parts.length === 4) {
-    const [vendorId, productId, , mode] = parts;
-    return [key, `${vendorId}:${productId}:${mode || 'unknown'}`];
-  }
-  return [key];
-}
-
-function readBlockedAutoDeviceKeys(): Set<string> {
-  if (typeof window === 'undefined') {
-    return new Set();
-  }
-
+function readLastUpdateCheckAt(): number {
   try {
-    const stored = window.localStorage.getItem(BLOCKED_AUTO_DEVICE_KEYS_STORAGE_KEY);
-    const parsed = stored ? JSON.parse(stored) : [];
-    const keys = Array.isArray(parsed)
-      ? parsed.filter((key): key is string => typeof key === 'string')
-      : [];
-    return new Set(keys.flatMap(expandBlockedAutoDeviceKeyAliases));
+    const value = Number(window.localStorage.getItem(UPDATE_LAST_CHECK_STORAGE_KEY));
+    return Number.isFinite(value) && value > 0 ? value : 0;
   } catch {
-    return new Set();
+    return 0;
   }
 }
 
-function writeBlockedAutoDeviceKeys(keys: Set<string>): void {
+function writeLastUpdateCheckAt(value: number): void {
   try {
-    if (!keys.size) {
-      window.localStorage.removeItem(BLOCKED_AUTO_DEVICE_KEYS_STORAGE_KEY);
-      return;
-    }
-    window.localStorage.setItem(BLOCKED_AUTO_DEVICE_KEYS_STORAGE_KEY, JSON.stringify([...keys]));
+    window.localStorage.setItem(UPDATE_LAST_CHECK_STORAGE_KEY, String(value));
   } catch {
-    // Ignore private-mode or storage-quota failures; in-memory blocking still works.
+    // A failed preference write only means the next launch may check again.
   }
+}
+
+function automaticUpdateCheckIsDue(now = Date.now()): boolean {
+  const lastCheck = readLastUpdateCheckAt();
+  return !lastCheck || lastCheck > now || now - lastCheck >= AUTO_UPDATE_CHECK_INTERVAL_MS;
 }
 
 function refreshResultMessage(
@@ -742,10 +730,14 @@ function refreshResultMessage(
   openSessionKept: boolean
 ): string {
   const checkedAt = formatClockTime();
+  const phase = nextInventory?.connectionPhase ?? nextStatus?.connectionPhase;
+  if (nextInventory?.fileAccessUnavailable) {
+    return `Checked ${checkedAt}: the phone did not return its files.`;
+  }
   if (openSessionKept) {
     return `Checked ${checkedAt}: phone-file session is still open.`;
   }
-  if (nextInventory?.state === 'connected' && nextInventory.devices.length) {
+  if (phase === 'ready' || (nextInventory?.state === 'connected' && nextInventory.devices.length)) {
     return `Checked ${checkedAt}: phone files are open.`;
   }
   if (!nextStatus) {
@@ -754,14 +746,17 @@ function refreshResultMessage(
 
   const rawDevice = nextStatus.rawDevices[0];
   const rawDeviceName = rawDevice?.vendor || rawDevice?.product || 'the phone';
-  if (rawDevice?.connectionMode === 'mtp' && nextStatus.state === 'connect-error') {
-    return `Checked ${checkedAt}: Mac sees ${rawDeviceName} over USB. The phone file session is not open yet.`;
+  if (phase === 'needs-mode-reset') {
+    return `Checked ${checkedAt}: ${rawDeviceName} did not answer. Switch USB to Charging, then back to File transfer.`;
+  }
+  if (phase === 'needs-replug') {
+    return `Checked ${checkedAt}: ${rawDeviceName} still did not answer. Unplug and reconnect it.`;
+  }
+  if (phase === 'usb-busy') {
+    return `Checked ${checkedAt}: another Mac app is using ${rawDeviceName}.`;
   }
   if (rawDevice?.connectionMode === 'usb-only') {
     return `Checked ${checkedAt}: Mac sees ${rawDeviceName}, but files are not open. Choose File transfer on the phone.`;
-  }
-  if (phoneNeedsUnlockOrAllow(nextStatus, nextInventory)) {
-    return `Checked ${checkedAt}: Mac sees ${rawDeviceName}, but the phone has not allowed file access. Unlock it and tap Allow if asked.`;
   }
   if (nextStatus.state === 'connect-error' && rawDevice) {
     return `Checked ${checkedAt}: Mac sees ${rawDeviceName}, but files are still not open.`;
@@ -770,70 +765,55 @@ function refreshResultMessage(
     return `Checked ${checkedAt}: no phone file-transfer connection is visible.`;
   }
   if (nextInventory?.ok === false) {
-    return `Checked ${checkedAt}: ${rawDeviceName} is visible, but phone files are still not open. Use Open files or Details.`;
+    return `Checked ${checkedAt}: ${rawDeviceName} is visible, but phone files are still not open.`;
   }
   return `Checked ${checkedAt}: phone connection checked.`;
 }
 
-function phoneNeedsUnlockOrAllow(
+function reportedConnectionPhase(
   status: DeviceStatus | null,
   inventory: InventoryResult | null
-): boolean {
-  const state = inventory?.state ?? status?.state ?? 'checking';
-  if (state !== 'connect-error' || !status?.rawDevices.length) {
-    return false;
+): MtpConnectionPhase {
+  if (inventory?.connectionPhase) {
+    return inventory.connectionPhase;
   }
-
-  const combinedText = [
-    status.message,
-    inventory?.message,
-    status.stderr,
-    inventory?.stderr
-  ]
-    .filter(Boolean)
-    .join('\n')
-    .toLowerCase();
-
-  return (
-    combinedText.includes('locked') ||
-    combinedText.includes('allow access') ||
-    combinedText.includes('not open') ||
-    combinedText.includes('could not connect')
-  );
-}
-
-function phoneNeedsProtectedUsbAccess(status: DeviceStatus | null): boolean {
-  return status?.rawDevices[0]?.needsDeviceAccessEntitlement === true;
-}
-
-function phoneFileSessionNotOpen(status: DeviceStatus | null, inventory: InventoryResult | null): boolean {
-  const state = inventory?.state ?? status?.state ?? 'checking';
-  return state === 'connect-error' && status?.rawDevices[0]?.connectionMode === 'mtp' && !status?.sessionOpen;
+  if (status?.connectionPhase) {
+    return status.connectionPhase;
+  }
+  if (!status?.rawDevices.length) {
+    return 'no-phone';
+  }
+  if (status.rawDevices.every((device) => device.connectionMode === 'usb-only')) {
+    return 'file-transfer-off';
+  }
+  if (status.sessionOpen && inventory?.state === 'connected' && inventory.devices.length) {
+    return 'ready';
+  }
+  return 'opening';
 }
 
 function phoneFileSessionText(status: DeviceStatus | null, inventory: InventoryResult | null): string {
-  const state = inventory?.state ?? status?.state ?? 'checking';
-  if (inventory?.protectedAccess && state === 'connected') {
-    return 'Open through protected access';
+  const phase = reportedConnectionPhase(status, inventory);
+  switch (phase) {
+    case 'ready':
+      return 'Open';
+    case 'opening':
+      return 'Opening';
+    case 'listing-storage':
+      return 'Open; reading storage';
+    case 'file-transfer-off':
+      return 'Not open; File transfer is off';
+    case 'needs-mode-reset':
+      return 'Not open; phone did not answer';
+    case 'needs-replug':
+      return 'Not open; reconnect required';
+    case 'usb-busy':
+      return 'Not open; USB is busy';
+    case 'cancelled':
+      return 'Opening canceled';
+    default:
+      return 'Not open';
   }
-  if (state === 'connected' || status?.sessionOpen) {
-    return 'Open';
-  }
-  if (phoneFileSessionNotOpen(status, inventory)) {
-    return 'Not open; USB is visible';
-  }
-  if (status?.rawDevices[0]?.connectionMode === 'usb-only') {
-    return 'Not open; phone is not in File Transfer mode';
-  }
-  return 'Not open';
-}
-
-function inventoryLooksLikeStorageFailure(inventory: InventoryResult | null): boolean {
-  if (inventory?.ok !== false) {
-    return false;
-  }
-  const text = `${inventory.message}\n${inventory.stderr ?? ''}`.toLowerCase();
-  return text.includes('storage') || text.includes('get_storage') || text.includes('get storage');
 }
 
 function stageStateLabel(state: ConnectionStageState): string {
@@ -895,62 +875,52 @@ function CommonMacFolderIcon({ folder }: { folder: CommonMacFolder }): JSX.Eleme
 }
 
 function stateLabel(status: DeviceStatus | null, inventory: InventoryResult | null): string {
-  const state = inventory?.state ?? status?.state ?? 'checking';
-  if (inventory?.protectedAccess && state === 'connected') {
-    return 'Files open';
-  }
-  switch (state) {
-    case 'connected':
+  switch (reportedConnectionPhase(status, inventory)) {
+    case 'ready':
       return 'Connected';
-    case 'no-device':
+    case 'no-phone':
       return 'No device';
-    case 'connect-error':
-      if (phoneFileSessionNotOpen(status, inventory)) {
-        return 'USB visible';
-      }
-      if (phoneNeedsUnlockOrAllow(status, inventory)) {
-        return 'Unlock phone';
-      }
-      return 'Files not open';
-    case 'bridge-missing':
-      return 'Bridge missing';
-    case 'checking':
-      return 'Checking';
-    case 'error':
-    case 'memory-error':
-      return 'Needs help';
+    case 'file-transfer-off':
+      return 'File transfer off';
+    case 'opening':
+      return 'Connecting';
+    case 'listing-storage':
+      return 'Reading storage';
+    case 'needs-mode-reset':
+      return 'Phone did not answer';
+    case 'needs-replug':
+      return 'Reconnect phone';
+    case 'usb-busy':
+      return 'USB busy';
+    case 'cancelled':
+      return 'Canceled';
     default:
-      return 'Needs help';
+      return 'Checking';
   }
 }
 
 function stateTitle(status: DeviceStatus | null, inventory: InventoryResult | null): string {
-  const state = inventory?.state ?? status?.state ?? 'checking';
-  if (inventory?.protectedAccess && state === 'connected') {
-    return 'Phone files are open through protected access.';
-  }
-  if (state === 'connect-error' && status?.rawDevices[0]?.connectionMode === 'mtp') {
-    if (phoneNeedsProtectedUsbAccess(status)) {
-      return 'The Mac can see this phone in File Transfer mode. The MTP file session is not open yet.';
-    }
-    return 'The phone is in File Transfer mode, but the MTP file session is not open yet.';
-  }
-  if (phoneNeedsUnlockOrAllow(status, inventory)) {
-    return 'Unlock the phone and tap Allow if Android asks to open file access.';
-  }
-  switch (state) {
-    case 'connected':
+  switch (reportedConnectionPhase(status, inventory)) {
+    case 'ready':
       return 'Phone files are open.';
-    case 'no-device':
+    case 'no-phone':
       return 'No phone file-transfer connection is visible to the Mac.';
-    case 'connect-error':
-      return 'The phone is connected, but its folders are not open to this app yet.';
-    case 'bridge-missing':
-      return 'The native phone-file helper is missing or not executable.';
-    case 'checking':
-      return 'Checking the phone connection.';
+    case 'file-transfer-off':
+      return 'The cable is connected, but File transfer is off on the phone.';
+    case 'opening':
+      return 'The cable and File transfer mode are ready. The app is opening the phone file connection.';
+    case 'listing-storage':
+      return 'The file session is open and the phone storage is being read.';
+    case 'needs-mode-reset':
+      return 'The phone did not answer. Switch USB to Charging, then back to File transfer.';
+    case 'needs-replug':
+      return 'The phone still did not answer. Unplug and reconnect it.';
+    case 'usb-busy':
+      return 'Another Mac app is using the phone USB connection.';
+    case 'cancelled':
+      return 'Opening phone files was canceled.';
     default:
-      return 'The phone connection needs attention.';
+      return 'Checking the phone connection.';
   }
 }
 
@@ -1001,6 +971,17 @@ function compareLocalEntries(a: LocalEntry, b: LocalEntry, key: SortKey, directi
   }
 
   return direction === 'asc' ? result : -result;
+}
+
+function browserRowForLocalEntry(entry: LocalEntry): BrowserRow {
+  return {
+    key: entry.path,
+    kind: entry.kind,
+    name: entry.name,
+    size: entry.size,
+    modified: entry.modified,
+    type: entry.type
+  };
 }
 
 function makeRows(
@@ -1066,9 +1047,8 @@ export function App(): JSX.Element {
   const [folderListProgress, setFolderListProgress] = useState<
     (FolderListProgress & { key: string }) | null
   >(null);
-  const [isRecovering, setIsRecovering] = useState(false);
-  const [recoveryResult, setRecoveryResult] = useState<AdminRecoveryResult | null>(null);
   const [loadingElapsedSeconds, setLoadingElapsedSeconds] = useState(0);
+  const [connectionElapsedSeconds, setConnectionElapsedSeconds] = useState(0);
   const [refreshFeedback, setRefreshFeedback] = useState<RefreshFeedback | null>(null);
   const [isDraggingTransfer, setIsDraggingTransfer] = useState(false);
   const [isDraggingMacFiles, setIsDraggingMacFiles] = useState(false);
@@ -1079,23 +1059,43 @@ export function App(): JSX.Element {
   const [newFolderName, setNewFolderName] = useState('');
   const [newFolderError, setNewFolderError] = useState<string | null>(null);
   const [newFolderBusy, setNewFolderBusy] = useState(false);
+  const [renameDialogTarget, setRenameDialogTarget] = useState<BrowserRow | null>(null);
+  const [renamePhoneName, setRenamePhoneName] = useState('');
+  const [renamePhoneError, setRenamePhoneError] = useState<string | null>(null);
+  const [phoneMutationBusy, setPhoneMutationBusy] = useState(false);
+  const [localNameDialog, setLocalNameDialog] = useState<LocalNameDialog | null>(null);
+  const [localItemName, setLocalItemName] = useState('');
+  const [localMutationError, setLocalMutationError] = useState<string | null>(null);
+  const [localMutationBusy, setLocalMutationBusy] = useState(false);
   const [activePane, setActivePane] = useState<ActivePane>('phone');
   const [phoneTransferOperation, setPhoneTransferOperation] = useState<TransferOperation>('copy');
   const [macTransferOperation, setMacTransferOperation] = useState<TransferOperation>('copy');
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => readStoredThemeMode());
   const [systemPrefersDark, setSystemPrefersDark] = useState(() => systemPrefersDarkTheme());
-  const [phoneViewMode, setPhoneViewMode] = useState<PhoneViewMode>(() => readStoredPhoneViewMode());
-  const [showHiddenFiles, setShowHiddenFiles] = useState(() => readStoredShowHiddenFiles());
+  const [phoneViewMode, setPhoneViewMode] = useState<FileViewMode>(() =>
+    readStoredViewMode(PHONE_VIEW_MODE_STORAGE_KEY)
+  );
+  const [macViewMode, setMacViewMode] = useState<FileViewMode>(() =>
+    readStoredViewMode(MAC_VIEW_MODE_STORAGE_KEY)
+  );
+  const [phoneShowHiddenFiles, setPhoneShowHiddenFiles] = useState(() =>
+    readStoredShowHiddenFiles(PHONE_SHOW_HIDDEN_STORAGE_KEY)
+  );
+  const [macShowHiddenFiles, setMacShowHiddenFiles] = useState(() =>
+    readStoredShowHiddenFiles(MAC_SHOW_HIDDEN_STORAGE_KEY)
+  );
   const [macPaneWidth, setMacPaneWidth] = useState(() => readStoredMacPaneWidth());
   const [isResizingPane, setIsResizingPane] = useState(false);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [diagnosticsBusy, setDiagnosticsBusy] = useState(false);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const [appUpdate, setAppUpdate] = useState<AppUpdateCheckResult | null>(null);
+  const [updateCheckBusy, setUpdateCheckBusy] = useState(false);
   const workspaceRef = useRef<HTMLElement>(null);
   const queuePaneRef = useRef<HTMLElement>(null);
   const phoneBrowserRef = useRef<HTMLDivElement>(null);
   const phoneBreadcrumbsRef = useRef<HTMLDivElement>(null);
-  const localListRef = useRef<HTMLDivElement>(null);
+  const localBrowserRef = useRef<HTMLDivElement>(null);
   const localBreadcrumbsRef = useRef<HTMLDivElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const phoneSelectionAnchorKey = useRef<string | null>(null);
@@ -1108,15 +1108,15 @@ export function App(): JSX.Element {
   const folderLoadTokens = useRef<Record<string, string>>({});
   const scanInFlight = useRef(false);
   const pollInFlight = useRef(false);
-  const recoveryInFlight = useRef(false);
   const inventoryRef = useRef<InventoryResult | null>(null);
   const lastAutoRawKey = useRef<string | null>(null);
   const lastAutoDeviceIdentityKey = useRef<string | null>(null);
   const lastVisibleConnectionKey = useRef<string | null>(null);
-  const blockedAutoDeviceKeys = useRef<Set<string>>(readBlockedAutoDeviceKeys());
-  const protectedAccessRawKey = useRef<string | null>(null);
-  const protectedAccessDeviceIdentityKey = useRef<string | null>(null);
-  const protectedAccessConnectionId = useRef<string | null>(null);
+  const blockedAutoDeviceKeys = useRef<Set<string>>(new Set());
+  const lastVisibleMode = useRef<'mtp' | 'usb-only' | null>(null);
+  const scanCancelRequested = useRef(false);
+  const lastScanFinishedAt = useRef(0);
+  const connectionAttemptClock = useRef<{ connectionKey: string; startedAt: number } | null>(null);
 
   const inventoryDevices = inventory?.devices ?? [];
   const device =
@@ -1152,8 +1152,10 @@ export function App(): JSX.Element {
   );
   const visibleLocationRows = useMemo(
     () =>
-      locationRows.filter((row) => showHiddenFiles || row.kind === 'storage' || !isHiddenFileName(row.name)),
-    [locationRows, showHiddenFiles]
+      locationRows.filter(
+        (row) => phoneShowHiddenFiles || row.kind === 'storage' || !isHiddenFileName(row.name)
+      ),
+    [locationRows, phoneShowHiddenFiles]
   );
   const rows = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -1247,49 +1249,55 @@ export function App(): JSX.Element {
       percent
     };
   }, [visibleQueueJobs]);
-  const canUploadToCurrentFolder = !!device && location.storageId !== null;
-  const rawMtpVisible = rawDevice?.connectionMode === 'mtp';
-  const visibleMtpSessionNotOpen = phoneFileSessionNotOpen(status, inventory);
+  const reportedPhase = reportedConnectionPhase(status, inventory);
+  // The session is open and the phone has simply not shared storage yet. That
+  // wait is rechecked in the background, and the recheck must not rewrite the
+  // screen: letting it through swapped the heading between "Reading phone
+  // storage" and "Waiting for your phone" about twice a second.
+  const awaitingSharedStorage =
+    !!status?.sessionOpen &&
+    inventory?.connectionIssue === 'storage-unavailable' &&
+    reportedPhase !== 'needs-replug';
+  const scanBusyForDisplay = isScanning && !awaitingSharedStorage;
+  const connectionPhase: MtpConnectionPhase = scanBusyForDisplay
+    ? status?.sessionOpen
+      ? 'listing-storage'
+      : 'opening'
+    : reportedPhase;
+  const connectionIssue: MtpConnectionIssue | undefined =
+    inventory?.connectionIssue ?? status?.connectionIssue;
+  const hasDevice =
+    inventory?.connectionPhase === 'ready' &&
+    inventory.state === 'connected' &&
+    !!device &&
+    status?.sessionOpen === true;
+  const canUploadToCurrentFolder = hasDevice && location.storageId !== null;
   const fileSessionStatus = phoneFileSessionText(status, inventory);
-  const protectedUsbAccessRequired = rawDevice?.needsDeviceAccessEntitlement === true;
-  const blockedAccessReason = protectedUsbAccessRequired
-    ? 'macOS also says protected USB access is required before this app can open the MTP file session.'
-    : 'The USB connection is visible, but the MTP OpenSession handshake did not complete.';
   const fileTransferInactive =
     !!rawDevice &&
-    !device &&
-    !isScanning &&
-    (rawDevice.connectionMode === 'usb-only' ||
-      status?.message.toLowerCase().includes('file transfer is not active'));
+    !hasDevice &&
+    connectionPhase === 'file-transfer-off';
   const noPhoneConnection =
     !rawDevice &&
-    !device &&
-    !isScanning &&
-    (inventory?.state === 'no-device' || status?.state === 'no-device');
+    !hasDevice &&
+    connectionPhase === 'no-phone';
   const cannotOpenPhone =
     !!rawDevice &&
-    !device &&
-    !isScanning &&
-    !fileTransferInactive &&
-    (inventory?.state === 'connect-error' ||
-      inventory?.state === 'error' ||
-      inventory?.ok === false ||
-      !!recoveryResult);
-  const diagnosticText = `${inventory?.stderr ?? ''}\n${status?.stderr ?? ''}`.toLowerCase();
-  const usbAccessDenied =
-    cannotOpenPhone &&
-    (visibleMtpSessionNotOpen ||
-      rawMtpVisible ||
-      diagnosticText.includes('libusb_claim_interface') ||
-      diagnosticText.includes('libusb_error_access') ||
-      diagnosticText.includes('access denied'));
+    !hasDevice &&
+    (connectionPhase === 'needs-mode-reset' ||
+      connectionPhase === 'needs-replug' ||
+      connectionPhase === 'usb-busy' ||
+      connectionPhase === 'cancelled');
   const statusMessage = inventory?.message ?? status?.message ?? 'Checking MTP status...';
-  const hasDevice = inventory?.state === 'connected' && !!device;
   const resolvedTheme = themeMode === 'system' ? (systemPrefersDark ? 'dark' : 'light') : themeMode;
   const canCreatePhoneFolder = hasDevice && location.storageId !== null;
-  const protectedAccessOpen = hasDevice && !!device?.protectedAccess;
-  const fileSessionOpen = hasDevice || !!status?.sessionOpen;
-  const storageFailure = fileSessionOpen && inventoryLooksLikeStorageFailure(inventory);
+  const fileSessionOpen = !!status?.sessionOpen;
+  const storageFailure = fileSessionOpen && inventory?.connectionIssue === 'storage-unavailable';
+  const storageAccessWait = awaitingSharedStorage;
+  // A Mac app (Preview, Photos, Image Capture) holding an Image Capture session
+  // keeps macOS reconnecting to the phone and resetting it, so the phone never
+  // answers. The main process names that app; showing it beats "still trying".
+  const usbOwnerApp = hasDevice ? undefined : inventory?.usbOwnerApp ?? status?.usbOwnerApp;
   const currentFolderName = location.crumbs[location.crumbs.length - 1]?.label ?? 'folder';
   const macDestinationLabel = folderLabelForPath(localPath || destination);
   const phoneDestinationLabel = location.storageId === null ? 'Phone folder' : currentFolderName;
@@ -1305,6 +1313,16 @@ export function App(): JSX.Element {
     selectedLocalEntries.length > 0 &&
     canUploadToCurrentFolder &&
     (macTransferOperation === 'copy' || macSelectionIsFilesOnly);
+  const phoneMutationBlocked =
+    phoneMutationBusy ||
+    phoneDownloadPlanning !== null ||
+    jobs.some((job) => job.status === 'active' || job.status === 'queued');
+  const canRenamePhoneSelection =
+    hasDevice && selectedTransferRows.length === 1 && !phoneMutationBlocked;
+  const canDeletePhoneSelection =
+    hasDevice && selectedTransferRows.length > 0 && !phoneMutationBlocked;
+  const localMutationBlocked =
+    localMutationBusy || jobs.some((job) => job.status === 'active' || job.status === 'queued');
   const browserLoading = isScanning || folderLoading;
   const browserLoadingTitle = folderLoading ? `Listing ${currentFolderName}` : 'Checking phone';
   const browserLoadingDetails = folderLoading
@@ -1335,8 +1353,8 @@ export function App(): JSX.Element {
   }, [device?.storages, hasDevice, location.storageId, query, rows.length, visibleLocationRows]);
   const connectionStages = useMemo<ConnectionStageItem[]>(() => {
     const cableDone = !!rawDevice || hasDevice;
-    const fileTransferDone = hasDevice || rawDevice?.connectionMode === 'mtp';
-    const fileSessionDone = hasDevice || !!status?.sessionOpen;
+    const fileTransferDone = hasDevice || (rawDevice?.connectionMode === 'mtp' && !fileTransferInactive);
+    const fileSessionDone = !!status?.sessionOpen;
     const storageDone = hasDevice && !!device?.storages.length;
     const folderDone = hasDevice && location.storageId !== null && !currentFolderError && !folderLoading;
 
@@ -1363,17 +1381,31 @@ export function App(): JSX.Element {
       },
       {
         key: 'session',
-        label: 'Open files',
+        label: 'Connect to phone',
         detail: fileSessionDone
-          ? protectedAccessOpen
-            ? 'The protected phone-file session is open.'
-            : 'The phone-file session is open.'
-          : isRecovering
-            ? 'Opening the protected phone-file session.'
-            : usbAccessDenied
-              ? 'Press Open files, then enter your Mac login password.'
-              : 'Waiting for Android to allow file access.',
-        state: fileSessionDone ? 'done' : isRecovering || usbAccessDenied ? 'current' : 'waiting'
+          ? 'The phone-file session is open.'
+          : usbOwnerApp
+            ? `Quit ${usbOwnerApp}; it is holding the phone through macOS Image Capture.`
+          : connectionPhase === 'opening'
+            ? 'Trying to open the phone file connection.'
+            : connectionPhase === 'needs-mode-reset'
+              ? 'Switch USB to Charging, then back to File transfer.'
+              : connectionPhase === 'needs-replug'
+                ? 'Unplug and reconnect the phone.'
+                : connectionPhase === 'usb-busy'
+                  ? 'Close other apps that are using the phone.'
+                  : connectionPhase === 'cancelled'
+                    ? 'Opening was canceled.'
+                    : 'Waiting for Android to expose its files.',
+        state: fileSessionDone
+          ? 'done'
+          : usbOwnerApp
+            ? 'blocked'
+          : connectionPhase === 'opening'
+            ? 'current'
+            : cannotOpenPhone
+              ? 'blocked'
+              : 'waiting'
       },
       {
         key: 'storage',
@@ -1405,15 +1437,15 @@ export function App(): JSX.Element {
     fileTransferInactive,
     folderLoading,
     hasDevice,
-    isRecovering,
     isScanning,
     location.storageId,
-    protectedAccessOpen,
+    connectionPhase,
+    cannotOpenPhone,
     rawDevice,
     rawDeviceName,
     status?.sessionOpen,
     storageFailure,
-    usbAccessDenied
+    usbOwnerApp
   ]);
   const phoneSelectionSummary = summarizePhoneSelection(selectedRows);
   const phoneSelectionGuidance = selectedRows.length
@@ -1455,6 +1487,8 @@ export function App(): JSX.Element {
     return {
       ok: false,
       state: nextStatus.state,
+      connectionPhase: nextStatus.connectionPhase,
+      connectionIssue: nextStatus.connectionIssue,
       message: nextStatus.message,
       devices: [],
       helperPath: nextStatus.helperPath,
@@ -1479,30 +1513,18 @@ export function App(): JSX.Element {
   }
 
   function resetBrowserToInventory(nextInventory: InventoryResult): void {
-    if (!nextInventory.protectedAccess) {
-      protectedAccessRawKey.current = null;
-      protectedAccessDeviceIdentityKey.current = null;
-      protectedAccessConnectionId.current = null;
-    }
     updateInventory(nextInventory);
     resetPhoneBrowserState();
   }
 
   function clearDeviceFromStatus(nextStatus: DeviceStatus): void {
-    protectedAccessRawKey.current = null;
-    protectedAccessDeviceIdentityKey.current = null;
-    protectedAccessConnectionId.current = null;
     setSelectedDeviceConnectionId(null);
     updateInventory(inventoryFromStatus(nextStatus));
     resetPhoneBrowserState();
   }
 
   function clearStalePhoneStateForNewAttachment(nextStatus: DeviceStatus): void {
-    protectedAccessRawKey.current = null;
-    protectedAccessDeviceIdentityKey.current = null;
-    protectedAccessConnectionId.current = null;
     lastAutoRawKey.current = null;
-    setRecoveryResult(null);
     setTransferNotice(null);
     setPhoneDownloadPlanning(null);
     phoneDownloadPlanningCancelRequested.current = false;
@@ -1511,13 +1533,15 @@ export function App(): JSX.Element {
   }
 
   function showBlockedAutoScanStatus(nextStatus: DeviceStatus): void {
-    protectedAccessRawKey.current = null;
-    protectedAccessDeviceIdentityKey.current = null;
-    protectedAccessConnectionId.current = null;
+    if (inventoryRef.current?.ok === false && inventoryRef.current.devices.length === 0) {
+      return;
+    }
     const nextInventory: InventoryResult = {
       ok: false,
       state: 'connect-error',
-      message: NORMAL_ACCESS_BLOCKED_MESSAGE,
+      connectionPhase: 'needs-mode-reset',
+      connectionIssue: 'phone-not-responding',
+      message: 'The phone did not answer. Switch USB to Charging, then back to File transfer.',
       devices: [],
       helperPath: nextStatus.helperPath,
       logPath: nextStatus.logPath,
@@ -1527,46 +1551,24 @@ export function App(): JSX.Element {
     resetPhoneBrowserState();
   }
 
-  function statusMatchesProtectedSession(nextStatus: DeviceStatus): boolean {
-    const connectionId = protectedAccessConnectionId.current;
-    const currentInventory = inventoryRef.current;
-    const openConnections = statusSessionConnectionIds(nextStatus);
-    const visibleConnections = nextStatus.rawDevices
-      .filter((candidate) => candidate.connectionMode !== 'usb-only')
-      .map(rawDeviceConnectionKey)
-      .filter((candidate): candidate is string => !!candidate);
-    const protectedSessionMatches =
-      !!connectionId &&
-      openConnections.has(connectionId);
-
-    return (
-      protectedSessionMatches &&
-      !!nextStatus.protectedSessionOpen &&
-      currentInventory?.state === 'connected' &&
-      currentInventory.devices.some(
-        (candidate) => candidate.connectionId === connectionId && candidate.protectedAccess
-      ) &&
-      visibleConnections.every((visibleConnection) =>
-        currentInventory.devices.some((candidate) => candidate.connectionId === visibleConnection)
-      )
-    );
-  }
-
   function statusMatchesOpenSession(nextStatus: DeviceStatus): boolean {
     const currentInventory = inventoryRef.current;
     const openConnections = statusSessionConnectionIds(nextStatus);
-    const visibleConnections = nextStatus.rawDevices
-      .filter((candidate) => candidate.connectionMode !== 'usb-only')
-      .map(rawDeviceConnectionKey)
-      .filter((candidate): candidate is string => !!candidate);
+    const visibleMtpDevices = nextStatus.rawDevices.filter(
+      (candidate) => candidate.connectionMode !== 'usb-only'
+    );
+    const visibleDevicesMatch = currentInventory
+      ? inventoryRepresentsVisibleMtpDevices(nextStatus, currentInventory)
+      : false;
+    const sessionMatchesInventory = currentInventory?.devices.some(
+      (candidate) => openConnections.has(candidate.connectionId)
+    );
     return (
       !!nextStatus.sessionOpen &&
       openConnections.size > 0 &&
       currentInventory?.state === 'connected' &&
-      currentInventory.devices.some((candidate) => openConnections.has(candidate.connectionId)) &&
-      visibleConnections.every((visibleConnection) =>
-        currentInventory.devices.some((candidate) => candidate.connectionId === visibleConnection)
-      )
+      (sessionMatchesInventory || visibleDevicesMatch) &&
+      (visibleMtpDevices.length === 0 || visibleDevicesMatch)
     );
   }
 
@@ -1575,35 +1577,28 @@ export function App(): JSX.Element {
       return;
     }
     blockedAutoDeviceKeys.current.clear();
-    writeBlockedAutoDeviceKeys(blockedAutoDeviceKeys.current);
   }
 
   function rememberAutomaticScanFailure(nextStatus: DeviceStatus): void {
     nextStatus.rawDevices.forEach((candidate) => {
       const connectionKey = rawDeviceConnectionKey(candidate);
-      if (connectionKey && candidate.usbSessionId) {
+      if (connectionKey) {
         blockedAutoDeviceKeys.current.add(`connection:${connectionKey}`);
       }
-      rawDeviceAutomaticBlockKeys(candidate).forEach((key) => blockedAutoDeviceKeys.current.add(key));
     });
-    writeBlockedAutoDeviceKeys(blockedAutoDeviceKeys.current);
   }
 
   function forgetAutomaticScanFailure(nextStatus: DeviceStatus): void {
     let changed = false;
     nextStatus.rawDevices.forEach((candidate) => {
       const connectionKey = rawDeviceConnectionKey(candidate);
-      if (connectionKey && candidate.usbSessionId) {
+      if (connectionKey) {
         changed = blockedAutoDeviceKeys.current.delete(`connection:${connectionKey}`) || changed;
       }
-      rawDeviceAutomaticBlockKeys(candidate).forEach((key) => {
-        changed = blockedAutoDeviceKeys.current.delete(key) || changed;
-      });
     });
     if (!changed) {
       return;
     }
-    writeBlockedAutoDeviceKeys(blockedAutoDeviceKeys.current);
   }
 
   function trackVisibleDeviceIdentity(nextStatus: DeviceStatus): void {
@@ -1612,28 +1607,41 @@ export function App(): JSX.Element {
         .map(rawDeviceConnectionKey)
         .filter((connectionKey): connectionKey is string => !!connectionKey)
     );
-    const trackedConnection =
-      selectedDeviceConnectionId ?? protectedAccessConnectionId.current ?? lastVisibleConnectionKey.current;
     if (!visibleConnections.size) {
       lastAutoDeviceIdentityKey.current = null;
       lastVisibleConnectionKey.current = null;
+      lastVisibleMode.current = null;
       return;
     }
 
-    if (trackedConnection && !visibleConnections.has(trackedConnection)) {
+    const trackedConnection =
+      selectedDeviceConnectionId ?? lastVisibleConnectionKey.current;
+    const previousIdentityKey = lastAutoDeviceIdentityKey.current;
+    const trackedRawDevice =
+      nextStatus.rawDevices.find(
+        (candidate) => rawDeviceConnectionKey(candidate) === trackedConnection
+      ) ??
+      nextStatus.rawDevices.find(
+        (candidate) => rawDeviceStableIdentityKey(candidate) === previousIdentityKey
+      ) ??
+      nextStatus.rawDevices[0];
+    const nextIdentityKey = rawDeviceStableIdentityKey(trackedRawDevice);
+    const nextConnectionKey = rawDeviceConnectionKey(trackedRawDevice);
+    const nextMode = trackedRawDevice.connectionMode ?? null;
+
+    if (
+      (previousIdentityKey && nextIdentityKey && previousIdentityKey !== nextIdentityKey) ||
+      (lastVisibleConnectionKey.current && nextConnectionKey && lastVisibleConnectionKey.current !== nextConnectionKey) ||
+      (lastVisibleMode.current && nextMode && lastVisibleMode.current !== nextMode)
+    ) {
       clearAutomaticScanFailures();
-      clearStalePhoneStateForNewAttachment(nextStatus);
+      if (previousIdentityKey && nextIdentityKey && previousIdentityKey !== nextIdentityKey) {
+        clearStalePhoneStateForNewAttachment(nextStatus);
+      }
     }
-    const nextTrackedConnection =
-      (selectedDeviceConnectionId && visibleConnections.has(selectedDeviceConnectionId)
-        ? selectedDeviceConnectionId
-        : null) ??
-      Array.from(visibleConnections)[0];
-    const trackedRawDevice = nextStatus.rawDevices.find(
-      (candidate) => rawDeviceConnectionKey(candidate) === nextTrackedConnection
-    );
-    lastAutoDeviceIdentityKey.current = rawDeviceStableIdentityKey(trackedRawDevice);
-    lastVisibleConnectionKey.current = nextTrackedConnection;
+    lastAutoDeviceIdentityKey.current = nextIdentityKey;
+    lastVisibleConnectionKey.current = nextConnectionKey;
+    lastVisibleMode.current = nextMode;
   }
 
   function automaticScanBlocked(nextStatus: DeviceStatus): boolean {
@@ -1644,32 +1652,37 @@ export function App(): JSX.Element {
       candidates.length > 0 &&
       candidates.every((candidate) => {
         const connectionKey = rawDeviceConnectionKey(candidate);
-        if (
-          connectionKey &&
-          candidate.usbSessionId &&
-          blockedAutoDeviceKeys.current.has(`connection:${connectionKey}`)
-        ) {
-          return true;
-        }
-        return rawDeviceAutomaticBlockKeys(candidate).some((key) =>
-          blockedAutoDeviceKeys.current.has(key)
-        );
+        return !!connectionKey && blockedAutoDeviceKeys.current.has(`connection:${connectionKey}`);
       })
     );
   }
 
+  function applyConnectionAttemptResult(
+    nextStatus: DeviceStatus,
+    nextInventory: InventoryResult
+  ): InventoryResult {
+    if (nextInventory.connectionIssue === 'storage-unavailable' && nextStatus.sessionOpen) {
+      // The helper is already open; keep asking only for storage on that session.
+      return nextInventory;
+    }
+    if (
+      nextInventory.ok ||
+      (nextInventory.connectionIssue !== 'phone-not-responding' &&
+        nextInventory.connectionIssue !== 'other-app-owns-usb')
+    ) {
+      return nextInventory;
+    }
+    return {
+      ...nextInventory,
+      connectionPhase: 'opening',
+      message: nextInventory.connectionIssue === 'other-app-owns-usb'
+        ? 'macOS briefly used the phone connection. The app will keep trying automatically.'
+        : 'The phone has not answered yet. The app will keep trying automatically.'
+    };
+  }
+
   async function scanDevice(options: { automatic?: boolean; manual?: boolean } = {}): Promise<void> {
     const manual = options.manual === true;
-    if (recoveryInFlight.current) {
-      if (manual) {
-        setRefreshFeedback({
-          phase: 'checking',
-          message: 'Already opening phone files. Finish the Mac password prompt first.'
-        });
-      }
-      return;
-    }
-
     if (scanInFlight.current) {
       if (manual) {
         setRefreshFeedback({
@@ -1681,8 +1694,8 @@ export function App(): JSX.Element {
     }
 
     scanInFlight.current = true;
+    scanCancelRequested.current = false;
     setIsScanning(true);
-    setRecoveryResult(null);
     let manualStatus: DeviceStatus | null = null;
     let manualInventory: InventoryResult | null = null;
     let openSessionKept = false;
@@ -1697,14 +1710,19 @@ export function App(): JSX.Element {
       const nextStatus = await refreshStatus();
       manualStatus = nextStatus;
       trackVisibleDeviceIdentity(nextStatus);
-      if (statusMatchesProtectedSession(nextStatus) || statusMatchesOpenSession(nextStatus)) {
+      if (statusMatchesOpenSession(nextStatus)) {
         openSessionKept = true;
         return;
       }
 
-      if (nextStatus.state !== 'connected') {
+      const hasMtpDevice = nextStatus.rawDevices.some(
+        (candidate) => candidate.connectionMode !== 'usb-only'
+      );
+      if (!hasMtpDevice) {
         lastAutoRawKey.current = null;
         if (nextStatus.state === 'no-device') {
+          clearAutomaticScanFailures();
+        } else {
           clearAutomaticScanFailures();
         }
         clearDeviceFromStatus(nextStatus);
@@ -1720,18 +1738,39 @@ export function App(): JSX.Element {
         return;
       }
 
-      const nextInventory = await window.mtp.scanInventory();
+      const scannedInventory = await window.mtp.scanInventory();
+      const nextInventory = scanCancelRequested.current
+        ? {
+            ...scannedInventory,
+            ok: false,
+            state: 'connect-error' as const,
+            connectionPhase: 'cancelled' as const,
+            connectionIssue: 'cancelled' as const,
+            message: 'Opening phone files was canceled.',
+            devices: []
+          }
+        : applyConnectionAttemptResult(nextStatus, scannedInventory);
       manualInventory = nextInventory;
-      if (!nextInventory.protectedAccess && statusMatchesOpenSession(nextStatus)) {
-        openSessionKept = true;
-        return;
-      }
 
       lastAutoRawKey.current = rawKey;
       if (nextInventory.ok) {
         forgetAutomaticScanFailure(nextStatus);
+        manualStatus = await refreshStatus();
       } else {
-        rememberAutomaticScanFailure(nextStatus);
+        if (nextInventory.connectionIssue === 'storage-unavailable') {
+          manualStatus = await refreshStatus();
+        }
+        const storageStillPending =
+          nextInventory.connectionIssue === 'storage-unavailable' &&
+          nextInventory.connectionPhase !== 'needs-replug' &&
+          manualStatus?.sessionOpen === true;
+        const openingStillPending =
+          nextInventory.connectionPhase === 'opening' &&
+          (nextInventory.connectionIssue === 'phone-not-responding' ||
+            nextInventory.connectionIssue === 'other-app-owns-usb');
+        if (nextInventory.connectionPhase !== 'cancelled' && !storageStillPending && !openingStillPending) {
+          rememberAutomaticScanFailure(nextStatus);
+        }
       }
       resetBrowserToInventory(nextInventory);
     } catch (error) {
@@ -1746,6 +1785,7 @@ export function App(): JSX.Element {
     } finally {
       scanInFlight.current = false;
       setIsScanning(false);
+      lastScanFinishedAt.current = Date.now();
       if (manual && !manualFailed) {
         setRefreshFeedback({
           phase: 'done',
@@ -1763,8 +1803,31 @@ export function App(): JSX.Element {
     await scanDevice({ manual: true });
   }
 
+  async function cancelOpeningPhoneFiles(): Promise<void> {
+    scanCancelRequested.current = true;
+    status?.rawDevices.forEach((candidate) => {
+      const connectionKey = rawDeviceConnectionKey(candidate);
+      if (connectionKey) {
+        blockedAutoDeviceKeys.current.add(`connection:${connectionKey}`);
+      }
+    });
+    await window.mtp.cancelConnectionAttempt();
+    const nextInventory: InventoryResult = {
+      ok: false,
+      state: 'connect-error',
+      connectionPhase: 'cancelled',
+      connectionIssue: 'cancelled',
+      message: 'Opening phone files was canceled.',
+      devices: [],
+      helperPath: status?.helperPath ?? inventory?.helperPath ?? '',
+      logPath: status?.logPath ?? inventory?.logPath ?? ''
+    };
+    updateInventory(nextInventory);
+    setRefreshFeedback({ phase: 'done', message: nextInventory.message });
+  }
+
   async function pollForPhone(): Promise<void> {
-    if (scanInFlight.current || pollInFlight.current) {
+    if (pollInFlight.current) {
       return;
     }
 
@@ -1773,15 +1836,29 @@ export function App(): JSX.Element {
       const nextStatus = await refreshStatus();
       const rawKey = statusAttachmentSetKey(nextStatus);
       trackVisibleDeviceIdentity(nextStatus);
+      const hasMtpDevice = nextStatus.rawDevices.some(
+        (candidate) => candidate.connectionMode !== 'usb-only'
+      );
+
+      // Opening storage can wait on a phone indefinitely. Keep the independent
+      // USB status path alive so a mode switch or reconnect cancels that stale
+      // attempt and lets the returning attachment start immediately.
+      if (scanInFlight.current) {
+        if (!hasMtpDevice) {
+          lastAutoRawKey.current = null;
+          clearAutomaticScanFailures();
+          clearDeviceFromStatus(nextStatus);
+        }
+        return;
+      }
       if (statusMatchesOpenSession(nextStatus)) {
         return;
       }
-      if (nextStatus.state !== 'connected') {
-        if (statusMatchesProtectedSession(nextStatus)) {
-          return;
-        }
+      if (!hasMtpDevice) {
         lastAutoRawKey.current = null;
         if (nextStatus.state === 'no-device') {
+          clearAutomaticScanFailures();
+        } else {
           clearAutomaticScanFailures();
         }
         const currentInventory = inventoryRef.current;
@@ -1799,10 +1876,9 @@ export function App(): JSX.Element {
 
       const currentInventory = inventoryRef.current;
       if (automaticScanBlocked(nextStatus)) {
-        const blockedInventoryIsVisible =
-          currentInventory?.state === 'connect-error' &&
-          currentInventory.message === NORMAL_ACCESS_BLOCKED_MESSAGE;
-        if (!blockedInventoryIsVisible) {
+        const failedInventoryIsVisible =
+          currentInventory?.ok === false && currentInventory.devices.length === 0;
+        if (!failedInventoryIsVisible) {
           showBlockedAutoScanStatus(nextStatus);
         }
         return;
@@ -1810,11 +1886,26 @@ export function App(): JSX.Element {
 
       const needsInventory =
         !!rawKey &&
-        (rawKey !== lastAutoRawKey.current ||
+        (nextStatus.sessionOpen !== true ||
+          rawKey !== lastAutoRawKey.current ||
           currentInventory?.state !== 'connected' ||
           !currentInventory.devices.length);
+      // Asking an already-open session for storage again is a real MTP round
+      // trip. The USB attachment check above stays fast so a mode switch is
+      // still caught immediately, but the repeat question waits out its own
+      // interval instead of running on every 400 ms tick.
+      const repeatingStorageQuestion =
+        nextStatus.sessionOpen === true &&
+        rawKey === lastAutoRawKey.current &&
+        currentInventory?.connectionIssue === 'storage-unavailable';
 
       if (needsInventory) {
+        if (
+          repeatingStorageQuestion &&
+          Date.now() - lastScanFinishedAt.current < SHARED_STORAGE_RETRY_INTERVAL_MS
+        ) {
+          return;
+        }
         lastAutoRawKey.current = rawKey;
         await scanDevice({ automatic: true });
       }
@@ -1858,6 +1949,20 @@ export function App(): JSX.Element {
       if (result.ok) {
         setFolderCache((current) => ({ ...current, [key]: result.objects }));
       } else {
+        if (result.fileAccessUnavailable) {
+          const nextStatus = await refreshStatus();
+          setSelectedDeviceConnectionId(null);
+          updateInventory({
+            ...inventoryFromStatus(nextStatus),
+            state: 'connect-error',
+            connectionPhase: result.connectionPhase ?? 'needs-mode-reset',
+            connectionIssue: result.connectionIssue ?? 'storage-unavailable',
+            message: result.message,
+            fileAccessUnavailable: true
+          });
+          resetPhoneBrowserState();
+          return;
+        }
         setFolderErrors((current) => ({ ...current, [key]: result.message }));
         setFolderCache((current) => ({ ...current, [key]: [] }));
       }
@@ -1939,7 +2044,7 @@ export function App(): JSX.Element {
     try {
       const result = await window.mtp.listLocalDirectory(
         directoryPath,
-        options.showHidden ?? showHiddenFiles
+        options.showHidden ?? macShowHiddenFiles
       );
       setLocalPath(result.path);
       setLocalParentPath(result.parentPath);
@@ -2038,6 +2143,7 @@ export function App(): JSX.Element {
     const requests: UploadRequest[] = [];
     const visitedFolders = new Set<string>();
     const phoneFolderObjects = new Map<number, MtpObject[]>();
+    const reservedPhoneNames = new Map<number, Set<string>>();
     let folderCount = 0;
     let conflictCount = 0;
 
@@ -2065,6 +2171,16 @@ export function App(): JSX.Element {
       const objects = result.objects;
       phoneFolderObjects.set(destinationParentId, objects);
       return objects;
+    }
+
+    async function occupiedPhoneNames(destinationParentId: number): Promise<Set<string>> {
+      const cached = reservedPhoneNames.get(destinationParentId);
+      if (cached) {
+        return cached;
+      }
+      const names = new Set((await listPhoneFolderObjects(destinationParentId)).map((object) => object.name));
+      reservedPhoneNames.set(destinationParentId, names);
+      return names;
     }
 
     async function ensurePhoneFolder(entry: LocalEntry, destinationParentId: number): Promise<number | null> {
@@ -2119,8 +2235,36 @@ export function App(): JSX.Element {
         const existing = existingObjects.find((object) => object.name === entry.name);
         if (existing) {
           conflictCount += 1;
+          if (existing.kind === 'file') {
+            const occupiedNames = await occupiedPhoneNames(destinationParentId);
+            const keepBothName = nextKeepBothPhoneName(entry.name, occupiedNames);
+            occupiedNames.add(keepBothName);
+            requests.push({
+              deviceIndex: activeDevice.index,
+              deviceConnectionId: activeDevice.connectionId,
+              storageId,
+              parentId: destinationParentId,
+              sourcePath: entry.path,
+              name: entry.name,
+              size: entry.size,
+              sourceIdentity: entry.identity,
+              operation,
+              existingDestination: {
+                objectId: existing.id,
+                storageId: existing.storageId,
+                parentId: existing.parentId,
+                name: existing.name,
+                kind: 'file',
+                size: existing.size,
+                modified: existing.modified > 0 ? existing.modified : undefined
+              },
+              keepBothName
+            });
+          }
           return;
         }
+
+        (await occupiedPhoneNames(destinationParentId)).add(entry.name);
 
         requests.push({
           deviceIndex: activeDevice.index,
@@ -2130,6 +2274,7 @@ export function App(): JSX.Element {
           sourcePath: entry.path,
           name: entry.name,
           size: entry.size,
+          sourceIdentity: entry.identity,
           operation
         });
         return;
@@ -2147,7 +2292,7 @@ export function App(): JSX.Element {
       if (folderId === null) {
         return;
       }
-      const localFolder = await window.mtp.listLocalDirectory(entry.path, showHiddenFiles);
+      const localFolder = await window.mtp.listLocalDirectory(entry.path, macShowHiddenFiles);
       if (!localFolder.ok) {
         throw new Error(localFolder.message || `Could not read ${entry.name} on the Mac.`);
       }
@@ -2213,7 +2358,7 @@ export function App(): JSX.Element {
       }
 
       if (!requests.length) {
-        const skipSummary = uploadSkipSummary(conflictCount);
+        const skipSummary = collisionActionSummary('skip', 0, 0, conflictCount);
         setTransferNotice({
           phase: conflictCount > 0 ? 'failed' : folderCount > 0 ? 'ready' : 'failed',
           message:
@@ -2235,13 +2380,27 @@ export function App(): JSX.Element {
         });
         return;
       }
-      const queued = moveResult?.jobs ?? (await window.mtp.startUploads(requests));
-      const skipSummary = uploadSkipSummary(conflictCount);
+      const queueResult = moveResult ?? (await window.mtp.startUploads(requests));
+      if (queueResult.collisionAction === 'cancel') {
+        setTransferNotice({
+          phase: 'ready',
+          message: 'Copy canceled. No file data was transferred.'
+        });
+        return;
+      }
+      const queued = queueResult.jobs;
+      const incompatibleCount = Math.max(conflictCount - queueResult.conflictCount, 0);
+      const conflictSummary = collisionActionSummary(
+        queueResult.collisionAction,
+        queueResult.conflictCount,
+        queueResult.skippedCount,
+        incompatibleCount
+      );
       setJobs((currentJobs) => mergeTransferJobs(currentJobs, queued));
       setTransferNotice({
         phase: queued.length ? 'queued' : 'failed',
         message: queued.length
-          ? `${queued.length} ${queued.length === 1 ? 'file' : 'files'} will be ${operation === 'move' ? 'moved' : 'copied'} to this phone folder.${skipSummary ? ` ${skipSummary}` : ''}`
+          ? `${queued.length} ${queued.length === 1 ? 'file' : 'files'} will be ${operation === 'move' ? 'moved' : 'copied'} to this phone folder.${conflictSummary ? ` ${conflictSummary}` : ''}`
           : 'No Mac files were queued.'
       });
     } catch (error) {
@@ -2448,17 +2607,28 @@ export function App(): JSX.Element {
 
   function focusMacPane(): void {
     setActivePane('mac');
-    localListRef.current?.focus();
+    localBrowserRef.current?.focus();
   }
 
-  function toggleHiddenFiles(): void {
-    const nextValue = !showHiddenFiles;
-    setShowHiddenFiles(nextValue);
+  function togglePhoneHiddenFiles(): void {
+    const nextValue = !phoneShowHiddenFiles;
+    setPhoneShowHiddenFiles(nextValue);
+    setActivePane('phone');
+  }
+
+  function toggleMacHiddenFiles(): void {
+    const nextValue = !macShowHiddenFiles;
+    setMacShowHiddenFiles(nextValue);
+    setActivePane('mac');
     void loadLocalDirectory(localPath || undefined, { showHidden: nextValue });
-    setTransferNotice({
-      phase: 'ready',
-      message: nextValue ? 'Hidden files are visible.' : 'Hidden files are hidden.'
-    });
+  }
+
+  function toggleActivePaneHiddenFiles(): void {
+    if (activePane === 'mac') {
+      toggleMacHiddenFiles();
+    } else {
+      togglePhoneHiddenFiles();
+    }
   }
 
   async function copyDiagnosticReport(): Promise<void> {
@@ -2483,9 +2653,50 @@ export function App(): JSX.Element {
     }
   }
 
+  async function checkAppUpdates(interactive: boolean): Promise<void> {
+    if (interactive) {
+      setUpdateCheckBusy(true);
+    }
+    try {
+      const result = await window.mtp.checkForUpdates(interactive);
+      setAppUpdate(result);
+    } catch (error) {
+      if (interactive) {
+        setTransferNotice({
+          phase: 'failed',
+          message: error instanceof Error ? error.message : 'Could not check for updates.'
+        });
+      }
+    } finally {
+      if (interactive) {
+        setUpdateCheckBusy(false);
+      }
+    }
+  }
+
+  async function openAvailableUpdate(): Promise<void> {
+    if (!appUpdate?.releaseTag) {
+      return;
+    }
+    const result = await window.mtp.openUpdateRelease(appUpdate.releaseTag);
+    if (!result.ok) {
+      setTransferNotice({ phase: 'failed', message: result.message });
+    }
+  }
+
   function getPhoneGridColumnCount(): number {
     const grid = phoneBrowserRef.current?.querySelector('.file-grid');
     if (!(grid instanceof HTMLElement)) {
+      return 1;
+    }
+    const template = window.getComputedStyle(grid).gridTemplateColumns;
+    const columns = template.split(' ').filter(Boolean).length;
+    return Math.max(1, columns);
+  }
+
+  function getMacGridColumnCount(): number {
+    const grid = localBrowserRef.current;
+    if (!grid?.classList.contains('local-grid')) {
       return 1;
     }
     const template = window.getComputedStyle(grid).gridTemplateColumns;
@@ -2517,8 +2728,13 @@ export function App(): JSX.Element {
   function handleAppMenuCommand(command: AppMenuCommand): void {
     switch (command) {
       case 'new-folder':
-        setActivePane('phone');
-        openNewFolderDialog();
+        openNewFolderForActivePane();
+        break;
+      case 'rename-selected-item':
+        openRenameSelectedItem();
+        break;
+      case 'delete-selected-items':
+        deleteSelectedItems();
         break;
       case 'copy-to-queue':
         copyActivePaneSelectionToQueue();
@@ -2545,28 +2761,39 @@ export function App(): JSX.Element {
         selectAllActiveContext();
         break;
       case 'open-files':
-        if (canAdminRecover) {
-          void recoverWithAdmin();
+        if (hasDevice) {
+          setTransferNotice({ phase: 'ready', message: 'Phone files are already open.' });
+        } else if (rawDevice?.connectionMode === 'mtp') {
+          void handleManualRefresh();
         } else {
           setTransferNotice({
-            phase: hasDevice ? 'ready' : 'failed',
-            message: hasDevice
-              ? 'Phone files are already open.'
-              : 'Open files is available after the Mac can see a phone that normal access cannot open.'
+            phase: 'failed',
+            message: 'Choose File transfer on the phone first.'
           });
         }
         break;
       case 'open-log':
         void window.mtp.openLog();
         break;
+      case 'check-for-updates':
+        void checkAppUpdates(true);
+        break;
       case 'view-list':
-        setPhoneViewMode('list');
+        if (activePane === 'mac') {
+          setMacViewMode('list');
+        } else {
+          setPhoneViewMode('list');
+        }
         break;
       case 'view-grid':
-        setPhoneViewMode('grid');
+        if (activePane === 'mac') {
+          setMacViewMode('grid');
+        } else {
+          setPhoneViewMode('grid');
+        }
         break;
       case 'toggle-hidden-files':
-        toggleHiddenFiles();
+        toggleActivePaneHiddenFiles();
         break;
       case 'theme-system':
         setThemeMode('system');
@@ -2599,6 +2826,41 @@ export function App(): JSX.Element {
     if ((event.metaKey || event.ctrlKey) && key === 'arrowup') {
       event.preventDefault();
       void goUpLocalDirectory();
+      return;
+    }
+    if (event.key === 'F2') {
+      event.preventDefault();
+      openRenameLocalItemDialog();
+      return;
+    }
+    if (!event.metaKey && !event.ctrlKey && !event.altKey &&
+        (event.key === 'Backspace' || event.key === 'Delete')) {
+      event.preventDefault();
+      void trashLocalEntries();
+      return;
+    }
+
+    if (macViewMode === 'grid') {
+      const columnCount = getMacGridColumnCount();
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        moveLocalSelection(columnCount, event.shiftKey);
+      } else if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        moveLocalSelection(-columnCount, event.shiftKey);
+      } else if (event.key === 'ArrowLeft') {
+        event.preventDefault();
+        moveLocalSelection(-1, event.shiftKey);
+      } else if (event.key === 'ArrowRight') {
+        event.preventDefault();
+        moveLocalSelection(1, event.shiftKey);
+      } else if (event.key === 'Enter') {
+        event.preventDefault();
+        openSelectedLocalEntry();
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        setSelectedLocalPaths(new Set());
+      }
       return;
     }
 
@@ -2691,6 +2953,157 @@ export function App(): JSX.Element {
     }
   }
 
+  function localMutationTargetForEntry(entry: LocalEntry): LocalMutationTarget {
+    return {
+      path: entry.path,
+      name: entry.name,
+      kind: entry.kind,
+      identity: entry.identity
+    };
+  }
+
+  function openLocalNewFolderDialog(): void {
+    if (!localPath) {
+      setTransferNotice({ phase: 'failed', message: 'Open a Mac folder first.' });
+      return;
+    }
+    if (localMutationBlocked) {
+      setTransferNotice({ phase: 'failed', message: 'Wait for the transfer queue to finish.' });
+      return;
+    }
+    setLocalNameDialog(null);
+    setNewFolderDialogOpen(false);
+    setRenameDialogTarget(null);
+    setLocalNameDialog({ mode: 'new-folder' });
+    setLocalItemName('');
+    setLocalMutationError(null);
+  }
+
+  function openRenameLocalItemDialog(entry?: LocalEntry): void {
+    const target = entry ?? (selectedLocalEntries.length === 1 ? selectedLocalEntries[0] : undefined);
+    if (!target) {
+      setTransferNotice({ phase: 'failed', message: 'Select one Mac file or folder to rename.' });
+      return;
+    }
+    if (localMutationBlocked) {
+      setTransferNotice({ phase: 'failed', message: 'Wait for the transfer queue to finish.' });
+      return;
+    }
+    setNewFolderDialogOpen(false);
+    setRenameDialogTarget(null);
+    setLocalNameDialog({ mode: 'rename', target });
+    setLocalItemName(target.name);
+    setLocalMutationError(null);
+  }
+
+  function closeLocalNameDialog(): void {
+    if (localMutationBusy) {
+      return;
+    }
+    setLocalNameDialog(null);
+    setLocalItemName('');
+    setLocalMutationError(null);
+  }
+
+  async function submitLocalNameDialog(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    if (!localNameDialog || !localPath) {
+      return;
+    }
+    const nameError = validateLocalItemName(localItemName);
+    if (nameError) {
+      setLocalMutationError(nameError);
+      return;
+    }
+    const excludedPath = localNameDialog.mode === 'rename' ? localNameDialog.target.path : null;
+    if (localEntries.some((entry) => entry.path !== excludedPath && entry.name.toLowerCase() === localItemName.toLowerCase())) {
+      setLocalMutationError('An item with that name is already here.');
+      return;
+    }
+
+    setLocalMutationBusy(true);
+    setLocalMutationError(null);
+    try {
+      const result = localNameDialog.mode === 'new-folder'
+        ? await window.mtp.createLocalFolder({ directoryPath: localPath, name: localItemName })
+        : await window.mtp.renameLocalItem({
+            directoryPath: localPath,
+            target: localMutationTargetForEntry(localNameDialog.target),
+            newName: localItemName
+          });
+      if (!result.ok) {
+        setLocalMutationError(result.message);
+        return;
+      }
+      setLocalNameDialog(null);
+      setLocalItemName('');
+      await loadLocalDirectory(localPath);
+      if (result.entry) {
+        setSelectedLocalPaths(new Set([result.entry.path]));
+        localSelectionAnchorPath.current = result.entry.path;
+      }
+      setTransferNotice({ phase: 'ready', message: result.message });
+    } catch (error) {
+      setLocalMutationError(error instanceof Error ? error.message : 'Could not change that Mac item.');
+    } finally {
+      setLocalMutationBusy(false);
+    }
+  }
+
+  async function trashLocalEntries(entries: LocalEntry[] = selectedLocalEntries): Promise<void> {
+    if (!localPath || !entries.length) {
+      setTransferNotice({ phase: 'failed', message: 'Select Mac files or folders to move to Trash.' });
+      return;
+    }
+    if (localMutationBlocked) {
+      setTransferNotice({ phase: 'failed', message: 'Wait for the transfer queue to finish.' });
+      return;
+    }
+    setLocalMutationBusy(true);
+    try {
+      const result = await window.mtp.trashLocalItems({
+        directoryPath: localPath,
+        targets: entries.map(localMutationTargetForEntry)
+      });
+      await loadLocalDirectory(localPath);
+      const failedPaths = result.failures.map(({ target }) => target.path);
+      setSelectedLocalPaths(new Set(failedPaths));
+      localSelectionAnchorPath.current = failedPaths[0] ?? null;
+      setTransferNotice({ phase: result.ok ? 'ready' : 'failed', message: result.message });
+    } catch (error) {
+      setTransferNotice({
+        phase: 'failed',
+        message: error instanceof Error ? error.message : 'Could not move the selected items to Trash.'
+      });
+    } finally {
+      setLocalMutationBusy(false);
+    }
+  }
+
+  function openNewFolderForActivePane(): void {
+    if (activePane === 'mac') {
+      openLocalNewFolderDialog();
+    } else {
+      openNewFolderDialog();
+    }
+  }
+
+  function openRenameSelectedItem(): void {
+    if (activePane === 'mac') {
+      openRenameLocalItemDialog();
+    } else {
+      openRenamePhoneItemDialog();
+    }
+  }
+
+  function deleteSelectedItems(): void {
+    if (activePane === 'mac') {
+      void trashLocalEntries();
+    } else {
+      void deletePhoneRows();
+    }
+  }
+
   function startLocalEntryDrag(entry: LocalEntry, event: DragEvent<HTMLButtonElement>): void {
     const selectedPaths = selectedLocalPaths.has(entry.path) ? Array.from(selectedLocalPaths) : [entry.path];
     const draggedEntries = sortedLocalEntries.filter((candidate) => selectedPaths.includes(candidate.path));
@@ -2704,6 +3117,143 @@ export function App(): JSX.Element {
     });
   }
 
+  function phoneMutationTargetForRow(row: BrowserRow): PhoneMutationTarget | null {
+    if ((row.kind !== 'file' && row.kind !== 'folder') || !row.object) {
+      return null;
+    }
+    return {
+      objectId: row.object.id,
+      storageId: row.object.storageId,
+      parentId: row.object.parentId,
+      name: row.object.name,
+      kind: row.object.kind,
+      size: row.object.kind === 'file' ? row.object.size : undefined,
+      modified: row.object.kind === 'file' && row.object.modified > 0
+        ? row.object.modified
+        : undefined
+    };
+  }
+
+  function openRenamePhoneItemDialog(row?: BrowserRow): void {
+    const targetRow = row ?? (selectedTransferRows.length === 1 ? selectedTransferRows[0] : undefined);
+    if (!targetRow || !phoneMutationTargetForRow(targetRow)) {
+      setTransferNotice({ phase: 'failed', message: 'Select one phone file or folder to rename.' });
+      return;
+    }
+    if (phoneMutationBlocked) {
+      setTransferNotice({ phase: 'failed', message: 'Wait for the current phone operation to finish.' });
+      return;
+    }
+    setNewFolderDialogOpen(false);
+    setRenameDialogTarget(targetRow);
+    setRenamePhoneName(targetRow.name);
+    setRenamePhoneError(null);
+  }
+
+  function closeRenamePhoneItemDialog(): void {
+    if (phoneMutationBusy) {
+      return;
+    }
+    setRenameDialogTarget(null);
+    setRenamePhoneName('');
+    setRenamePhoneError(null);
+  }
+
+  async function renamePhoneItemFromDialog(event: FormEvent<HTMLFormElement>): Promise<void> {
+    event.preventDefault();
+    const target = renameDialogTarget ? phoneMutationTargetForRow(renameDialogTarget) : null;
+    if (!device || !target) {
+      setRenamePhoneError('The phone item is no longer available. Refresh the folder and try again.');
+      return;
+    }
+    const nameError = validatePhoneItemName(renamePhoneName);
+    if (nameError) {
+      setRenamePhoneError(nameError);
+      return;
+    }
+    const duplicate = currentFolderObjects.some(
+      (object) => object.id !== target.objectId && object.name.toLowerCase() === renamePhoneName.toLowerCase()
+    );
+    if (duplicate) {
+      setRenamePhoneError('An item with that name is already here.');
+      return;
+    }
+
+    setPhoneMutationBusy(true);
+    setRenamePhoneError(null);
+    try {
+      const result = await window.mtp.renamePhoneItem({
+        deviceIndex: device.index,
+        deviceConnectionId: device.connectionId,
+        target,
+        newName: renamePhoneName
+      });
+      if (!result.ok) {
+        setRenamePhoneError(result.message || 'Could not rename that phone item.');
+        return;
+      }
+      setRenameDialogTarget(null);
+      setRenamePhoneName('');
+      if (location.storageId !== null) {
+        setSelectedKeys(new Set([objectRowKey(device.connectionId, location.storageId, target.objectId)]));
+        await loadFolder(location.storageId, location.folderId, true);
+      }
+      setTransferNotice({ phase: 'ready', message: result.message });
+    } catch (error) {
+      setRenamePhoneError(error instanceof Error ? error.message : 'Could not rename that phone item.');
+    } finally {
+      setPhoneMutationBusy(false);
+    }
+  }
+
+  async function deletePhoneRows(rowsToDelete: BrowserRow[] = selectedTransferRows): Promise<void> {
+    if (!device) {
+      setTransferNotice({ phase: 'failed', message: 'The phone is not connected.' });
+      return;
+    }
+    const targets = rowsToDelete
+      .map(phoneMutationTargetForRow)
+      .filter((target): target is PhoneMutationTarget => target !== null);
+    if (!targets.length) {
+      setTransferNotice({ phase: 'failed', message: 'Select phone files or folders to delete.' });
+      return;
+    }
+    if (phoneMutationBlocked) {
+      setTransferNotice({ phase: 'failed', message: 'Wait for the current phone operation to finish.' });
+      return;
+    }
+
+    setPhoneMutationBusy(true);
+    try {
+      const result = await window.mtp.deletePhoneItems({
+        deviceIndex: device.index,
+        deviceConnectionId: device.connectionId,
+        targets
+      });
+      if (!result.confirmed) {
+        if (!result.ok) {
+          setTransferNotice({ phase: 'failed', message: result.message });
+        }
+        return;
+      }
+      if (location.storageId !== null) {
+        const failedKeys = result.failures.map(({ target }) =>
+          objectRowKey(device.connectionId, location.storageId as number, target.objectId)
+        );
+        setSelectedKeys(new Set(failedKeys));
+        await loadFolder(location.storageId, location.folderId, true);
+      }
+      setTransferNotice({ phase: result.ok ? 'ready' : 'failed', message: result.message });
+    } catch (error) {
+      setTransferNotice({
+        phase: 'failed',
+        message: error instanceof Error ? error.message : 'Could not delete the selected phone items.'
+      });
+    } finally {
+      setPhoneMutationBusy(false);
+    }
+  }
+
   function openNewFolderDialog(): void {
     if (!canCreatePhoneFolder) {
       setTransferNotice({
@@ -2712,6 +3262,8 @@ export function App(): JSX.Element {
       });
       return;
     }
+    setLocalNameDialog(null);
+    setRenameDialogTarget(null);
     setNewFolderName('');
     setNewFolderError(null);
     setNewFolderDialogOpen(true);
@@ -2784,15 +3336,50 @@ export function App(): JSX.Element {
     void scanDevice({ automatic: true });
     void loadLocalDirectory();
     void window.mtp.getCommonMacFolders().then(setCommonMacFolders).catch(() => setCommonMacFolders([]));
-    const interval = window.setInterval(() => {
-      void pollForPhone();
-    }, AUTO_PHONE_CHECK_INTERVAL_MS);
-    return () => window.clearInterval(interval);
+    let stopped = false;
+    let timer: number | undefined;
+    const scheduleNextPhoneCheck = (): void => {
+      const delay = inventoryRef.current?.connectionPhase === 'ready'
+        ? CONNECTED_PHONE_CHECK_INTERVAL_MS
+        : WAITING_PHONE_CHECK_INTERVAL_MS;
+      timer = window.setTimeout(async () => {
+        await pollForPhone();
+        if (!stopped) {
+          scheduleNextPhoneCheck();
+        }
+      }, delay);
+    };
+    scheduleNextPhoneCheck();
+    return () => {
+      stopped = true;
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+      }
+    };
   }, []);
 
   useEffect(() => {
     inventoryRef.current = inventory;
   }, [inventory]);
+
+  useEffect(
+    () =>
+      window.mtp.onConnectionPhase((event: MtpConnectionPhaseEvent) => {
+        setStatus((current) => {
+          if (!current) {
+            return current;
+          }
+          return {
+            ...current,
+            connectionPhase: event.phase,
+            sessionOpen: event.phase === 'listing-storage',
+            sessionConnectionId: event.connectionId ?? current.sessionConnectionId,
+            sessionConnectionIds: event.connectionId ? [event.connectionId] : current.sessionConnectionIds
+          };
+        });
+      }),
+    []
+  );
 
   useEffect(
     () =>
@@ -2820,7 +3407,7 @@ export function App(): JSX.Element {
 
   useEffect(() => {
     try {
-      window.localStorage.setItem(VIEW_MODE_STORAGE_KEY, phoneViewMode);
+      window.localStorage.setItem(PHONE_VIEW_MODE_STORAGE_KEY, phoneViewMode);
     } catch {
       // Ignore storage failures; the selected view still applies for this session.
     }
@@ -2828,11 +3415,27 @@ export function App(): JSX.Element {
 
   useEffect(() => {
     try {
-      window.localStorage.setItem(SHOW_HIDDEN_STORAGE_KEY, String(showHiddenFiles));
+      window.localStorage.setItem(MAC_VIEW_MODE_STORAGE_KEY, macViewMode);
+    } catch {
+      // Ignore storage failures; the selected view still applies for this session.
+    }
+  }, [macViewMode]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(PHONE_SHOW_HIDDEN_STORAGE_KEY, String(phoneShowHiddenFiles));
     } catch {
       // Ignore storage failures; the selected visibility still applies for this session.
     }
-  }, [showHiddenFiles]);
+  }, [phoneShowHiddenFiles]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(MAC_SHOW_HIDDEN_STORAGE_KEY, String(macShowHiddenFiles));
+    } catch {
+      // Ignore storage failures; the selected visibility still applies for this session.
+    }
+  }, [macShowHiddenFiles]);
 
   useEffect(() => {
     try {
@@ -2930,6 +3533,33 @@ export function App(): JSX.Element {
   }, [browserLoading, currentFolderKey]);
 
   useEffect(() => {
+    const connectionKey = rawDevice ? rawDeviceConnectionKey(rawDevice) : null;
+    const opening =
+      !!connectionKey &&
+      rawDevice?.connectionMode === 'mtp' &&
+      (connectionPhase === 'opening' ||
+        connectionPhase === 'listing-storage' ||
+        storageAccessWait);
+
+    if (!opening || !connectionKey) {
+      connectionAttemptClock.current = null;
+      setConnectionElapsedSeconds(0);
+      return;
+    }
+
+    if (connectionAttemptClock.current?.connectionKey !== connectionKey) {
+      connectionAttemptClock.current = { connectionKey, startedAt: Date.now() };
+    }
+    const updateElapsed = (): void => {
+      const startedAt = connectionAttemptClock.current?.startedAt ?? Date.now();
+      setConnectionElapsedSeconds(Math.floor((Date.now() - startedAt) / 1000));
+    };
+    updateElapsed();
+    const interval = window.setInterval(updateElapsed, 1000);
+    return () => window.clearInterval(interval);
+  }, [connectionPhase, storageAccessWait, rawDevice?.connectionId, rawDevice?.connectionMode]);
+
+  useEffect(() => {
     return window.mtp.onTransferEvent((event) => {
       setJobs((currentJobs) => mergeTransferJobs(currentJobs, [event.job]));
       if (
@@ -2942,6 +3572,14 @@ export function App(): JSX.Element {
         event.job.parentId === location.folderId
       ) {
         void loadFolder(location.storageId, location.folderId, true);
+      }
+      if (
+        event.type === 'completed' &&
+        event.job.direction === 'download' &&
+        localPath &&
+        event.job.destinationDirectory === localPath
+      ) {
+        void loadLocalDirectory(localPath);
       }
       if (
         event.type === 'completed' &&
@@ -3040,7 +3678,7 @@ export function App(): JSX.Element {
 
   function contextMenuCoordinates(event: ReactMouseEvent<HTMLElement>): { x: number; y: number } {
     const menuWidth = 236;
-    const menuHeight = 280;
+    const menuHeight = 400;
     return {
       x: Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8)),
       y: Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight - 8))
@@ -3282,6 +3920,17 @@ export function App(): JSX.Element {
       openSelectedPhoneRow();
       return;
     }
+    if (event.key === 'F2') {
+      event.preventDefault();
+      openRenamePhoneItemDialog();
+      return;
+    }
+    if (!event.metaKey && !event.ctrlKey && !event.altKey &&
+        (event.key === 'Backspace' || event.key === 'Delete')) {
+      event.preventDefault();
+      void deletePhoneRows();
+      return;
+    }
 
     if (phoneViewMode === 'grid') {
       const columnCount = getPhoneGridColumnCount();
@@ -3442,7 +4091,15 @@ export function App(): JSX.Element {
       });
       return;
     }
-    const queued = moveResult?.jobs ?? (await window.mtp.startDownloads(plan.requests));
+    const queueResult = moveResult ?? (await window.mtp.startDownloads(plan.requests));
+    if (queueResult.collisionAction === 'cancel') {
+      setTransferNotice({
+        phase: 'ready',
+        message: 'Copy canceled. No file data was transferred.'
+      });
+      return;
+    }
+    const queued = queueResult.jobs;
     if (plan.directories.length) {
       const failedBeforeTracking = queued.some(
         (job) => job.status === 'failed' || job.status === 'canceled'
@@ -3464,11 +4121,18 @@ export function App(): JSX.Element {
         };
       }
     }
-    const renameSummary = downloadRenameSummary(
-      queued.filter((job) => job.status !== 'failed' && job.status !== 'canceled')
-    );
+    const renameSummary = queueResult.collisionAction === 'keep-both'
+      ? ''
+      : downloadRenameSummary(
+          queued.filter((job) => job.status !== 'failed' && job.status !== 'canceled')
+        );
     const failedCount = queued.filter((job) => job.status === 'failed').length;
     const queuedCount = queued.filter((job) => job.status === 'queued' || job.status === 'active').length;
+    const conflictSummary = collisionActionSummary(
+      queueResult.collisionAction,
+      queueResult.conflictCount,
+      queueResult.skippedCount
+    );
     setJobs((currentJobs) => mergeTransferJobs(currentJobs, queued));
     setTransferNotice({
       phase: failedCount && !queuedCount ? 'failed' : 'queued',
@@ -3477,7 +4141,7 @@ export function App(): JSX.Element {
           ? `${failedCount} ${failedCount === 1 ? 'file needs' : 'files need'} attention before copying. Check the queue for the reason.`
           : `${queuedCount} ${queuedCount === 1 ? 'file' : 'files'} will be ${operation === 'move' ? 'moved' : 'copied'} to ${destinationDirectory}${
               failedCount ? ` · ${failedCount} need attention` : ''
-            }.${renameSummary ? ` ${renameSummary}` : ''}`
+            }.${renameSummary ? ` ${renameSummary}` : ''}${conflictSummary ? ` ${conflictSummary}` : ''}`
     });
   }
 
@@ -3587,56 +4251,6 @@ export function App(): JSX.Element {
       if (!result.ok) {
         throw new Error(result.message || `Unable to create ${directory.path}.`);
       }
-    }
-  }
-
-  async function recoverWithAdmin(): Promise<void> {
-    recoveryInFlight.current = true;
-    setIsRecovering(true);
-    setRecoveryResult(null);
-    setRefreshFeedback({
-      phase: 'checking',
-      message: 'Opening phone files. Keep the phone unlocked; this can take a few minutes if macOS resets USB.'
-    });
-    let scanAfterRecovery = false;
-    try {
-      const result = await window.mtp.recoverWithAdmin();
-      setRecoveryResult(result);
-      if (result.ok && result.inventory) {
-        const rawKey = rawDeviceKey(result.rawDevice) ?? statusRawKey(status);
-        const identityKey = rawDeviceIdentityKey(result.rawDevice) ?? statusDeviceIdentityKey(status);
-        if (rawKey) {
-          protectedAccessRawKey.current = rawKey;
-          lastAutoRawKey.current = rawKey;
-        }
-        if (identityKey) {
-          protectedAccessDeviceIdentityKey.current = identityKey;
-        }
-        const connectionId =
-          result.rawDevice?.connectionId ?? result.inventory.devices[0]?.connectionId ?? null;
-        if (connectionId) {
-          protectedAccessConnectionId.current = connectionId;
-        }
-        clearAutomaticScanFailures();
-        resetBrowserToInventory(result.inventory);
-        setRefreshFeedback({
-          phase: 'done',
-          message: 'Phone files are open.'
-        });
-      } else if (result.ok) {
-        scanAfterRecovery = true;
-      } else {
-        setRefreshFeedback({
-          phase: 'failed',
-          message: result.message
-        });
-      }
-    } finally {
-      recoveryInFlight.current = false;
-      setIsRecovering(false);
-    }
-    if (scanAfterRecovery) {
-      await scanDevice();
     }
   }
 
@@ -3926,6 +4540,27 @@ export function App(): JSX.Element {
           <button
             type="button"
             role="menuitem"
+            disabled={phoneActionCount !== 1 || phoneMutationBlocked}
+            onClick={() =>
+              runContextMenuAction(() => openRenamePhoneItemDialog(phoneActionRows[0]))
+            }
+          >
+            <Pencil size={15} />
+            <span>Rename</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            className="danger"
+            disabled={!phoneActionCount || phoneMutationBlocked}
+            onClick={() => runContextMenuAction(() => void deletePhoneRows(phoneActionRows))}
+          >
+            <Trash2 size={15} />
+            <span>{phoneActionCount > 1 ? `Delete ${phoneActionCount} Items...` : 'Delete Permanently...'}</span>
+          </button>
+          <button
+            type="button"
+            role="menuitem"
             className="separated"
             disabled={!folderLoading}
             onClick={() => runContextMenuAction(() => void stopFolderListing())}
@@ -4018,6 +4653,34 @@ export function App(): JSX.Element {
         <button
           type="button"
           role="menuitem"
+          disabled={localActionCount !== 1 || localMutationBlocked}
+          onClick={() => runContextMenuAction(() => openRenameLocalItemDialog(localActionEntries[0]))}
+        >
+          <Pencil size={15} />
+          <span>Rename</span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          className="danger"
+          disabled={!localActionCount || localMutationBlocked}
+          onClick={() => runContextMenuAction(() => void trashLocalEntries(localActionEntries))}
+        >
+          <Trash2 size={15} />
+          <span>Move to Trash</span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          disabled={!localPath || localMutationBlocked}
+          onClick={() => runContextMenuAction(openLocalNewFolderDialog)}
+        >
+          <FolderPlus size={15} />
+          <span>New Mac Folder</span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
           className="separated"
           disabled={!localParentPath || localParentPath === localPath}
           onClick={() => runContextMenuAction(() => void goUpLocalDirectory())}
@@ -4056,7 +4719,7 @@ export function App(): JSX.Element {
 
   useEffect(() => {
     function handleGlobalKeyDown(event: KeyboardEvent): void {
-      if (!(event.metaKey || event.ctrlKey)) {
+      if (event.defaultPrevented || !(event.metaKey || event.ctrlKey)) {
         return;
       }
 
@@ -4089,8 +4752,13 @@ export function App(): JSX.Element {
 
       if (key === 'n' && !isEditableElement(event.target)) {
         event.preventDefault();
-        focusPhonePane();
-        openNewFolderDialog();
+        openNewFolderForActivePane();
+        return;
+      }
+
+      if (key === 'd' && !isEditableElement(event.target)) {
+        event.preventDefault();
+        openRenameSelectedItem();
         return;
       }
 
@@ -4131,35 +4799,73 @@ export function App(): JSX.Element {
 
   useEffect(() => window.mtp.onAppMenuCommand(handleAppMenuCommand));
 
+  useEffect(() => {
+    if (!automaticUpdateCheckIsDue()) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      writeLastUpdateCheckAt(Date.now());
+      void checkAppUpdates(false);
+    }, AUTO_UPDATE_START_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, []);
+
   const queueActive = jobs.some((job) => job.status === 'active' || job.status === 'queued');
   const connectionStateClass =
     phoneDownloadPlanning
       ? 'preparing'
       : queueSummary.activeTransfers || queueSummary.queuedTransfers
       ? 'transfer-active'
-      : inventory?.state ?? status?.state ?? 'checking';
+      : usbOwnerApp
+        ? 'connect-error'
+      : awaitingSharedStorage
+        ? 'checking'
+      : connectionPhase === 'ready'
+        ? 'connected'
+        : connectionPhase === 'no-phone'
+          ? 'no-device'
+          : connectionPhase === 'opening' || connectionPhase === 'listing-storage'
+            ? 'checking'
+            : 'connect-error';
   const connectionLabel = phoneDownloadPlanning
     ? 'Preparing'
     : queueSummary.activeTransfers
     ? 'Transferring'
-    : queueSummary.queuedTransfers
+      : queueSummary.queuedTransfers
       ? 'Transfer queued'
-      : stateLabel(status, inventory);
+      : usbOwnerApp
+        ? `Quit ${usbOwnerApp}`
+      : awaitingSharedStorage
+        ? 'Waiting for phone'
+      : scanBusyForDisplay
+        ? connectionPhase === 'listing-storage'
+          ? 'Reading storage'
+          : 'Opening files'
+        : connectionPhase === 'opening' && connectionIssue
+          ? 'Still trying'
+        : stateLabel(status, inventory);
   const connectionTitle = phoneDownloadPlanning
     ? 'Listing phone folders before the copy starts. Keep the phone unlocked and connected.'
     : queueSummary.activeTransfers
     ? 'Copying files. Keep the phone unlocked and the cable connected.'
-    : queueSummary.queuedTransfers
+      : queueSummary.queuedTransfers
       ? 'Files are queued and will copy when the current phone operation finishes.'
-      : stateTitle(status, inventory);
-  const shouldShowRecover = usbAccessDenied && !!rawDevice && !fileTransferInactive;
-  const canAdminRecover = shouldShowRecover && !isRecovering;
+      : usbOwnerApp
+        ? `${usbOwnerApp} is using the phone through macOS Image Capture. Quit ${usbOwnerApp} and the app will connect on its own.`
+      : awaitingSharedStorage
+        ? 'The phone file session is open, but the phone has not shared its files yet. Choose File transfer on the phone.'
+      : scanBusyForDisplay
+        ? connectionPhase === 'listing-storage'
+          ? 'The file session is open. Reading the phone storage list.'
+          : `Trying to open the phone file connection for ${formatDuration(Math.max(connectionElapsedSeconds, 1))}. This continues until it connects or you press Cancel.`
+        : stateTitle(status, inventory);
+  const shouldShowRetry = cannotOpenPhone && !!rawDevice;
   const workspaceStyle = {
     '--mac-pane-width': `${macPaneWidth}px`
   } as CSSProperties;
 
   return (
-    <main className="app-shell" data-theme={resolvedTheme}>
+    <main className="app-shell" data-theme={resolvedTheme} data-connection-phase={connectionPhase}>
       <section className="topbar">
         <div className="traffic-space" />
         <div className="brand">
@@ -4167,6 +4873,23 @@ export function App(): JSX.Element {
           <span>Android File Transfer for macOS</span>
         </div>
         <div className="topbar-actions">
+          {updateCheckBusy ? (
+            <button type="button" className="update-action" disabled aria-label="Checking for updates">
+              <Loader2 size={13} className="spin" />
+              <span>Checking</span>
+            </button>
+          ) : appUpdate?.status === 'update-available' && appUpdate.latestVersion && appUpdate.releaseTag ? (
+            <button
+              type="button"
+              className="update-action available"
+              aria-label={`Version ${appUpdate.latestVersion} is available`}
+              title={`View version ${appUpdate.latestVersion} on GitHub`}
+              onClick={() => void openAvailableUpdate()}
+            >
+              <ExternalLink size={13} />
+              <span>Update</span>
+            </button>
+          ) : null}
           <div className="theme-switch" role="group" aria-label="Theme">
             <button
               type="button"
@@ -4205,17 +4928,214 @@ export function App(): JSX.Element {
             role="status"
             aria-live="polite"
           >
-            {isScanning || queueActive ? <Loader2 size={14} className="spin" /> : <Circle size={10} fill="currentColor" />}
+            {isScanning || queueActive || connectionPhase === 'opening' || connectionPhase === 'listing-storage'
+              ? <Loader2 size={14} className="spin" />
+              : <Circle size={10} fill="currentColor" />}
             <span>{connectionLabel}</span>
           </div>
         </div>
       </section>
 
-      <section
-        className={`workspace ${isResizingPane ? 'resizing-pane' : ''}`}
-        ref={workspaceRef}
-        style={workspaceStyle}
-      >
+      {!hasDevice ? (
+        <section className="connection-gate" role="status" aria-live="polite">
+          <div className={`connection-gate-icon state-${connectionStateClass}`} aria-hidden="true">
+            {isScanning || storageAccessWait || connectionPhase === 'opening' || connectionPhase === 'listing-storage' ? (
+              usbOwnerApp ? <AlertTriangle size={34} /> : <Loader2 size={34} className="spin" />
+            ) : cannotOpenPhone ? (
+              <AlertTriangle size={34} />
+            ) : (
+              <Smartphone size={36} />
+            )}
+          </div>
+
+          <div className="connection-gate-copy">
+            <h1>
+              {!rawDevice
+                ? isScanning ? 'Looking for your phone...' : 'Connect your Android phone'
+                : connectionPhase === 'file-transfer-off'
+                  ? 'Choose File transfer on your phone'
+                  : usbOwnerApp
+                    ? `Quit ${usbOwnerApp} to free your phone`
+                  : connectionPhase === 'opening'
+                    ? connectionIssue
+                      ? 'Still trying to connect to your phone...'
+                      : 'Connecting to your phone...'
+                    : connectionPhase === 'listing-storage'
+                      ? 'Connected. Reading phone storage...'
+                      : storageAccessWait
+                        ? 'Waiting for your phone to share its files...'
+                      : connectionPhase === 'needs-mode-reset'
+                        ? 'Reset File transfer on your phone'
+                        : connectionPhase === 'needs-replug'
+                          ? 'Your phone stopped responding'
+                          : connectionPhase === 'usb-busy'
+                            ? 'Close the app using your phone'
+                            : connectionPhase === 'cancelled'
+                              ? 'Opening was canceled'
+                              : 'Opening your phone files...'}
+            </h1>
+            {!rawDevice ? (
+              <p>Connect with a USB data cable and unlock the phone. The app will detect it automatically.</p>
+            ) : fileTransferInactive ? (
+              <p>
+                Swipe down on the phone, tap the USB notification, then choose <strong>File transfer</strong>.
+                Keep the phone unlocked; this app will continue automatically.
+              </p>
+            ) : usbOwnerApp ? (
+              <p>
+                <strong>{usbOwnerApp}</strong> is holding {rawDeviceName} through macOS Image Capture. Each time it
+                reconnects, the phone is reset, so nothing else can open it. Quit {usbOwnerApp}; this app will
+                connect on its own. If the phone is still silent 15 seconds later, switch its USB mode to{' '}
+                <strong>Charging</strong> and back to <strong>File transfer</strong> so it starts answering again.
+              </p>
+            ) : storageAccessWait ? (
+              <p>
+                {rawDeviceName} is connected, but it has not shared any files yet. Unlock the phone, swipe down,
+                tap the USB notification, and choose <strong>File transfer</strong>; tap <strong>Allow</strong>{' '}
+                if Android asks. The app keeps checking on its own for as long as the cable is in.
+              </p>
+            ) : connectionPhase === 'opening' && connectionIssue === 'other-app-owns-usb' ? (
+              <p>
+                macOS briefly used the phone connection first. Keep {rawDeviceName} unlocked and in <strong>File
+                transfer</strong>. The app keeps trying automatically; you do not need to press anything here.
+              </p>
+            ) : connectionPhase === 'opening' && connectionIssue === 'phone-not-responding' ? (
+              <p>
+                The cable and <strong>File transfer</strong> mode are detected, but the phone file connection has not
+                opened yet. Keep {rawDeviceName} unlocked. The app keeps trying automatically; you do not need to
+                reconnect or press Retry.
+              </p>
+            ) : connectionPhase === 'needs-mode-reset' ? (
+              <p>
+                On {rawDeviceName}, switch USB to <strong>Charging</strong>, then back to <strong>File transfer</strong>.
+                Keep the phone unlocked. The app will retry when the USB mode changes.
+              </p>
+            ) : connectionPhase === 'needs-replug' ? (
+              <p>
+                The app connected to {rawDeviceName}, but the phone stopped sending its file list. Unplug the cable,
+                reconnect it, unlock the phone, and choose <strong>File transfer</strong>. The app will try again
+                automatically.
+              </p>
+            ) : connectionPhase === 'usb-busy' ? (
+              <p>Close Photos, Image Capture, and other Android transfer apps, then try again.</p>
+            ) : connectionPhase === 'cancelled' ? (
+              <p>The phone was not changed. Press Retry when you are ready.</p>
+            ) : connectionPhase === 'listing-storage' ? (
+              <p>The file connection is open. The app is waiting for the phone&apos;s storage list.</p>
+            ) : (
+              <p>
+                Keep {rawDeviceName} unlocked and tap <strong>Allow</strong> if Android asks. This normally takes only
+                a few seconds.
+              </p>
+            )}
+            {storageAccessWait && connectionElapsedSeconds >= 12 ? (
+              <p className="connection-attempt-status">
+                Nothing shared yet after <strong>{formatDuration(connectionElapsedSeconds)}</strong>. If the
+                phone&apos;s USB option is still set to <strong>Charging</strong> or{' '}
+                <strong>No data transfer</strong>, switch it to <strong>File transfer</strong> now.
+              </p>
+            ) : null}
+            {connectionPhase === 'opening' && rawDevice?.connectionMode === 'mtp' && !usbOwnerApp ? (
+              <p className="connection-attempt-status">
+                {connectionElapsedSeconds >= 10 ? (
+                  <>
+                    The phone is not answering yet. Still watching after <strong>{formatDuration(connectionElapsedSeconds)}</strong>.
+                    Leave this screen open,
+                    switch USB to <strong>Charging</strong>, then back to <strong>File transfer</strong>. The app will
+                    catch the new connection automatically.
+                  </>
+                ) : (
+                  <>
+                    Trying for <strong>{formatDuration(Math.max(connectionElapsedSeconds, 1))}</strong>. The app will keep
+                    trying until it connects or you press Cancel.
+                  </>
+                )}
+              </p>
+            ) : null}
+          </div>
+
+          {(isScanning || storageAccessWait || connectionPhase === 'opening' || connectionPhase === 'listing-storage') &&
+          rawDevice?.connectionMode === 'mtp' ? (
+            <button
+              className="text-button connection-gate-primary"
+              type="button"
+              onClick={() => void cancelOpeningPhoneFiles()}
+            >
+              <X size={18} />
+              <span>Cancel</span>
+            </button>
+          ) : shouldShowRetry ? (
+            <button
+              className="primary-button connection-gate-primary"
+              type="button"
+              onClick={() => void handleManualRefresh()}
+            >
+              <RotateCcw size={19} />
+              <span>Try again</span>
+            </button>
+          ) : null}
+
+          <div className="connection-gate-secondary">
+            <button
+              className={`text-button details-button ${showDiagnostics ? 'active' : ''}`}
+              type="button"
+              aria-expanded={showDiagnostics}
+              onClick={() => setShowDiagnostics((visible) => !visible)}
+            >
+              Details
+            </button>
+          </div>
+
+          {showDiagnostics && (
+            <div className="connection-gate-details">
+              <ol className="connection-stages main" aria-label="Phone connection progress">
+                {connectionStages.map((stage) => (
+                  <li className={`connection-stage ${stage.state}`} key={stage.key}>
+                    <span className="connection-stage-dot" aria-hidden="true" />
+                    <div>
+                      <span className="connection-stage-title">
+                        {stage.label}
+                        <small>{stageStateLabel(stage.state)}</small>
+                      </span>
+                      <p>{stage.detail}</p>
+                    </div>
+                  </li>
+                ))}
+              </ol>
+              <p>{statusMessage}</p>
+              {renderRefreshFeedback()}
+              <div className="connection-gate-detail-actions">
+                <button
+                  className="text-button"
+                  type="button"
+                  disabled={scanBusyForDisplay}
+                  onClick={() => void handleManualRefresh()}
+                >
+                  {scanBusyForDisplay ? <Loader2 size={14} className="spin" /> : <RefreshCcw size={14} />}
+                  <span>{scanBusyForDisplay ? 'Checking...' : 'Check again'}</span>
+                </button>
+                <button
+                  type="button"
+                  className="text-button"
+                  disabled={diagnosticsBusy}
+                  onClick={() => void copyDiagnosticReport()}
+                >
+                  {diagnosticsBusy ? <Loader2 size={13} className="spin" /> : <ClipboardList size={13} />}
+                  <span>Copy report</span>
+                </button>
+                <button className="text-button" type="button" onClick={() => void window.mtp.openLog()}>
+                  Open log
+                </button>
+              </div>
+            </div>
+          )}
+        </section>
+      ) : (
+        <section
+          className={`workspace ${isResizingPane ? 'resizing-pane' : ''}`}
+          ref={workspaceRef}
+          style={workspaceStyle}
+        >
         <aside className="sidebar">
           <div className="device-block">
             <div className="device-title">
@@ -4225,10 +5145,6 @@ export function App(): JSX.Element {
             <p className="device-subtitle">
               {fileTransferInactive
                 ? 'The cable works. On the phone, choose File transfer; this app will detect it automatically.'
-                : protectedAccessOpen
-                ? 'Phone files are open through protected access. You can browse and copy now.'
-                : usbAccessDenied
-                ? 'USB is visible in File Transfer mode. The phone file session is not open yet.'
                 : cannotOpenPhone
                 ? 'Phone detected, but files are not open yet. Follow the steps in the main panel.'
                 : statusMessage}
@@ -4248,22 +5164,6 @@ export function App(): JSX.Element {
               ))}
             </ol>
             <div className="device-actions">
-              {shouldShowRecover && (
-                <button
-                  className="primary-button sidebar-protected-action"
-                  title="Open one protected phone-file session. The app explains the Mac password prompt before it appears."
-                  aria-label="Open phone files"
-                  disabled={!canAdminRecover}
-                  onClick={() => void recoverWithAdmin()}
-                >
-                  {isRecovering ? (
-                    <Loader2 size={14} className="spin" />
-                  ) : (
-                    <ShieldCheck size={14} />
-                  )}
-                  <span>{isRecovering ? 'Opening...' : 'Open files'}</span>
-                </button>
-              )}
               <button
                 className="icon-button"
                 title={
@@ -4289,12 +5189,6 @@ export function App(): JSX.Element {
               </button>
             </div>
             {renderRefreshFeedback()}
-            {recoveryResult && !isRecovering && (
-              <div className={`recovery-message ${recoveryResult.ok ? 'ok' : 'failed'}`}>
-                <ShieldCheck size={14} />
-                <span>{recoveryResult.message}</span>
-              </div>
-            )}
           </div>
 
           {inventoryDevices.length > 1 && (
@@ -4359,11 +5253,7 @@ export function App(): JSX.Element {
               );
             })}
             {!device?.storages.length && (
-              <div className="empty-note">
-                {usbAccessDenied
-                  ? 'Phone USB is visible. Files appear after the MTP file session opens.'
-                  : 'No mounted MTP storage.'}
-              </div>
+              <div className="empty-note">No mounted MTP storage.</div>
             )}
           </div>
 
@@ -4485,7 +5375,10 @@ export function App(): JSX.Element {
                 aria-label="Show phone files as a list"
                 aria-pressed={phoneViewMode === 'list'}
                 title="List view"
-                onClick={() => setPhoneViewMode('list')}
+                onClick={() => {
+                  setPhoneViewMode('list');
+                  setActivePane('phone');
+                }}
               >
                 <LayoutList size={14} />
               </button>
@@ -4495,7 +5388,10 @@ export function App(): JSX.Element {
                 aria-label="Show phone files as a grid"
                 aria-pressed={phoneViewMode === 'grid'}
                 title="Grid view"
-                onClick={() => setPhoneViewMode('grid')}
+                onClick={() => {
+                  setPhoneViewMode('grid');
+                  setActivePane('phone');
+                }}
               >
                 <LayoutGrid size={14} />
               </button>
@@ -4503,13 +5399,35 @@ export function App(): JSX.Element {
 
             <button
               type="button"
-              className={`icon-button hidden-files-toggle ${showHiddenFiles ? 'active' : ''}`}
-              aria-label={showHiddenFiles ? 'Hide hidden files' : 'Show hidden files'}
-              aria-pressed={showHiddenFiles}
-              title={showHiddenFiles ? 'Hide hidden files' : 'Show hidden files'}
-              onClick={toggleHiddenFiles}
+              className={`icon-button hidden-files-toggle ${phoneShowHiddenFiles ? 'active' : ''}`}
+              aria-label={phoneShowHiddenFiles ? 'Hide hidden phone files' : 'Show hidden phone files'}
+              aria-pressed={phoneShowHiddenFiles}
+              title={phoneShowHiddenFiles ? 'Hide hidden phone files' : 'Show hidden phone files'}
+              onClick={togglePhoneHiddenFiles}
             >
-              {showHiddenFiles ? <Eye size={15} /> : <EyeOff size={15} />}
+              {phoneShowHiddenFiles ? <Eye size={15} /> : <EyeOff size={15} />}
+            </button>
+
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="Rename selected phone item"
+              title="Rename selected phone item (F2 or Cmd+D)"
+              disabled={!canRenamePhoneSelection}
+              onClick={() => openRenamePhoneItemDialog()}
+            >
+              <Pencil size={15} />
+            </button>
+
+            <button
+              type="button"
+              className="icon-button danger-icon-button"
+              aria-label="Delete selected phone items permanently"
+              title="Delete selected phone items permanently"
+              disabled={!canDeletePhoneSelection}
+              onClick={() => void deletePhoneRows()}
+            >
+              <Trash2 size={15} />
             </button>
 
             <button
@@ -4709,10 +5627,10 @@ export function App(): JSX.Element {
                   </li>
                   <li>{usbModeHelpText}</li>
                   <li>If Android asks whether to allow access, tap Allow.</li>
-                  <li>This app checks again automatically every 3 seconds.</li>
+                  <li>This app watches for File transfer and continues automatically.</li>
                 </ol>
 
-                <p className="auto-check-note">No need to refresh. The app checks again every 3 seconds.</p>
+                <p className="auto-check-note">No need to refresh. The app keeps watching for your phone.</p>
               </div>
             ) : fileTransferInactive ? (
               <div className="connection-help" role="status" aria-live="polite">
@@ -4736,33 +5654,18 @@ export function App(): JSX.Element {
                   <li>Choose File transfer, Transferring files, or Android Auto.</li>
                   <li>{usbModeHelpText}</li>
                   <li>If Android asks whether to allow access, tap Allow.</li>
-                  <li>Wait a few seconds. This app checks again automatically every 3 seconds.</li>
+                  <li>Wait a few seconds. This app keeps checking automatically.</li>
                 </ol>
 
-                <p className="auto-check-note">No need to refresh. The app checks again every 3 seconds.</p>
+                <p className="auto-check-note">No need to refresh. The app keeps watching for your phone.</p>
               </div>
             ) : cannotOpenPhone ? (
               <div className="connection-help" role="status" aria-live="polite">
                 <div className="connection-help-header">
                   <AlertTriangle size={22} />
                   <div>
-                    {usbAccessDenied ? (
-                      <>
-                        <h2>Phone is connected. Files are not open yet.</h2>
-                        <p>
-                          {rawDeviceName} is visible over USB in File Transfer mode, but the
-                          MTP file session is not open. {blockedAccessReason}
-                        </p>
-                      </>
-                    ) : (
-                      <>
-                        <h2>Unlock the phone and allow file access.</h2>
-                        <p>
-                          Your Mac sees {rawDeviceName}, but Android has not opened its files to this
-                          Mac yet.
-                        </p>
-                      </>
-                    )}
+                    <h2>{stateLabel(status, inventory)}</h2>
+                    <p>{stateTitle(status, inventory)}</p>
                   </div>
                 </div>
 
@@ -4781,69 +5684,24 @@ export function App(): JSX.Element {
                   ))}
                 </ol>
 
-                {usbAccessDenied ? (
-                  <ol className="help-steps">
-                    <li>Keep the phone unlocked and leave it in File Transfer mode.</li>
-                    <li>If the phone asks to allow access, tap Allow.</li>
-                    <li>If the same Allow question keeps coming back, stop there; the session is not staying open.</li>
-                    <li>Close Photos, Image Capture, Android File Transfer, OpenMTP, or any other phone-transfer app.</li>
-                    <li>Press Open files below.</li>
-                    <li>Choose Continue in the explanation window.</li>
-                    <li>
-                      If the Mac password window says osascript wants to make changes, enter the password
-                      you use to unlock this Mac.
-                    </li>
-                    <li>If you canceled or waited too long, press Open files again.</li>
-                    <li>Only unplug the cable if the phone disappears from the left side.</li>
-                  </ol>
-                ) : (
-                  <ol className="help-steps">
-                    <li>Unlock the phone and keep the screen awake.</li>
-                    <li>If Android asks to allow access to phone data, tap Allow.</li>
-                    <li>
-                      On the phone, open the USB notification and choose File transfer or Transferring
-                      files.
-                    </li>
-                    <li>
-                      Close Photos, Image Capture, Android File Transfer, OpenMTP, or any other
-                      phone-transfer app.
-                    </li>
-                    <li>Wait a few seconds. This app checks again automatically every 3 seconds.</li>
-                  </ol>
-                )}
+                <ol className="help-steps">
+                  <li>Keep the phone unlocked and tap Allow if Android asks.</li>
+                  <li>
+                    {connectionPhase === 'needs-replug'
+                      ? 'Unplug and reconnect the cable, then choose File transfer.'
+                      : 'Switch USB to Charging, then back to File transfer.'}
+                  </li>
+                </ol>
 
                 <div className="help-actions">
-                  {shouldShowRecover && (
-                    <button
-                      className="primary-button protected-action"
-                      disabled={!canAdminRecover}
-                      onClick={() => void recoverWithAdmin()}
-                    >
-                      {isRecovering ? (
-                        <Loader2 size={15} className="spin" />
-                      ) : (
-                        <ShieldCheck size={15} />
-                      )}
-                      <span>{isRecovering ? 'Opening files...' : 'Open files'}</span>
-                    </button>
-                  )}
                   <button
-                    className={shouldShowRecover ? 'text-button' : 'primary-button'}
+                    className="primary-button"
                     onClick={() => void handleManualRefresh()}
                   >
                     {isScanning ? <Loader2 size={15} className="spin" /> : <RefreshCcw size={15} />}
                     <span>{refreshButtonLabel()}</span>
                   </button>
                 </div>
-
-                {shouldShowRecover && (
-                  <p className="recovery-explain">
-                    Check now repeats the automatic check. Open files asks macOS to open one protected phone-file
-                    session. If the Mac password window says osascript, that is the system prompt for
-                    this step; use your normal Mac login password or choose Cancel. If Open files fails,
-                    the phone can still be visible over USB while its MTP file session stays closed.
-                  </p>
-                )}
               </div>
             ) : phoneViewMode === 'grid' && rows.length > 0 ? (
               <div className="file-grid" role="grid" aria-label="Phone files">
@@ -4970,42 +5828,11 @@ export function App(): JSX.Element {
                   <div className="section-label">Mac</div>
                   <strong>{folderLabelForPath(localPath || destination)}</strong>
                 </div>
-                <div className="local-title-actions">
-                  <span className="local-count">
-                    {localLoading
-                      ? 'Loading'
-                      : `${localEntries.length} ${localEntries.length === 1 ? 'item' : 'items'}`}
-                  </span>
-                  <div className="nav-buttons local-nav-buttons">
-                    <button
-                      className="icon-button"
-                      title="Back"
-                      aria-label="Back in Mac folder history"
-                      disabled={!localBackStack.length}
-                      onClick={() => void goBackLocalDirectory()}
-                    >
-                      <ChevronLeft size={14} />
-                    </button>
-                    <button
-                      className="icon-button"
-                      title="Forward"
-                      aria-label="Forward in Mac folder history"
-                      disabled={!localForwardStack.length}
-                      onClick={() => void goForwardLocalDirectory()}
-                    >
-                      <ChevronRight size={14} />
-                    </button>
-                    <button
-                      className="icon-button"
-                      title="Up"
-                      aria-label="Parent Mac folder"
-                      disabled={!localParentPath || localParentPath === localPath}
-                      onClick={() => void goUpLocalDirectory()}
-                    >
-                      <ArrowUp size={14} />
-                    </button>
-                  </div>
-                </div>
+                <span className="local-count">
+                  {localLoading
+                    ? 'Loading'
+                    : `${localEntries.length} ${localEntries.length === 1 ? 'item' : 'items'}`}
+                </span>
               </div>
               <div className="destination-actions">
                 <button className="destination-button" onClick={() => void chooseMacFolder()}>
@@ -5041,6 +5868,105 @@ export function App(): JSX.Element {
                     {crumb.label}
                   </button>
                 ))}
+              </div>
+
+              <div className="local-browser-toolbar">
+                <div className="nav-buttons local-nav-buttons">
+                  <button
+                    className="icon-button"
+                    title="New Mac folder (Cmd+N)"
+                    aria-label="Create a folder in the open Mac folder"
+                    disabled={!localPath || localMutationBlocked}
+                    onClick={openLocalNewFolderDialog}
+                  >
+                    <FolderPlus size={14} />
+                  </button>
+                  <button
+                    className="icon-button"
+                    title="Rename selected Mac item (F2 or Cmd+D)"
+                    aria-label="Rename selected Mac item"
+                    disabled={selectedLocalEntries.length !== 1 || localMutationBlocked}
+                    onClick={() => openRenameLocalItemDialog()}
+                  >
+                    <Pencil size={14} />
+                  </button>
+                  <button
+                    className="icon-button danger-icon-button"
+                    title="Move selected Mac items to Trash"
+                    aria-label="Move selected Mac items to Trash"
+                    disabled={!selectedLocalEntries.length || localMutationBlocked}
+                    onClick={() => void trashLocalEntries()}
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                  <button
+                    className="icon-button"
+                    title="Back"
+                    aria-label="Back in Mac folder history"
+                    disabled={!localBackStack.length}
+                    onClick={() => void goBackLocalDirectory()}
+                  >
+                    <ChevronLeft size={14} />
+                  </button>
+                  <button
+                    className="icon-button"
+                    title="Forward"
+                    aria-label="Forward in Mac folder history"
+                    disabled={!localForwardStack.length}
+                    onClick={() => void goForwardLocalDirectory()}
+                  >
+                    <ChevronRight size={14} />
+                  </button>
+                  <button
+                    className="icon-button"
+                    title="Up"
+                    aria-label="Parent Mac folder"
+                    disabled={!localParentPath || localParentPath === localPath}
+                    onClick={() => void goUpLocalDirectory()}
+                  >
+                    <ArrowUp size={14} />
+                  </button>
+                </div>
+                <div className="local-view-actions">
+                  <div className="view-switch" role="group" aria-label="Mac file view">
+                    <button
+                      type="button"
+                      className={macViewMode === 'list' ? 'active' : ''}
+                      aria-label="Show Mac files as a list"
+                      aria-pressed={macViewMode === 'list'}
+                      title="List view"
+                      onClick={() => {
+                        setMacViewMode('list');
+                        setActivePane('mac');
+                      }}
+                    >
+                      <LayoutList size={14} />
+                    </button>
+                    <button
+                      type="button"
+                      className={macViewMode === 'grid' ? 'active' : ''}
+                      aria-label="Show Mac files as a grid"
+                      aria-pressed={macViewMode === 'grid'}
+                      title="Grid view"
+                      onClick={() => {
+                        setMacViewMode('grid');
+                        setActivePane('mac');
+                      }}
+                    >
+                      <LayoutGrid size={14} />
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    className={`icon-button hidden-files-toggle ${macShowHiddenFiles ? 'active' : ''}`}
+                    aria-label={macShowHiddenFiles ? 'Hide hidden Mac files' : 'Show hidden Mac files'}
+                    aria-pressed={macShowHiddenFiles}
+                    title={macShowHiddenFiles ? 'Hide hidden Mac files' : 'Show hidden Mac files'}
+                    onClick={toggleMacHiddenFiles}
+                  >
+                    {macShowHiddenFiles ? <Eye size={15} /> : <EyeOff size={15} />}
+                  </button>
+                </div>
               </div>
 
               <div className="local-actions pane-transfer-bar local-transfer-bar">
@@ -5088,10 +6014,10 @@ export function App(): JSX.Element {
               </div>
 
               <div
-                className="local-list"
-                role="list"
+                className={`local-browser ${macViewMode === 'grid' ? 'local-grid' : 'local-list'}`}
+                role={macViewMode === 'grid' ? 'grid' : 'list'}
                 aria-label="Mac files"
-                ref={localListRef}
+                ref={localBrowserRef}
                 tabIndex={0}
                 onFocus={() => setActivePane('mac')}
                 onKeyDown={handleLocalPaneKeyDown}
@@ -5103,7 +6029,7 @@ export function App(): JSX.Element {
                     <span>Loading Mac folder...</span>
                   </div>
                 )}
-                {!localLoading && localEntries.length > 0 && (
+                {!localLoading && localEntries.length > 0 && macViewMode === 'list' && (
                   <div className="local-column-header">
                     <span />
                     <button
@@ -5144,7 +6070,7 @@ export function App(): JSX.Element {
                     </button>
                   </div>
                 )}
-                {!localLoading &&
+                {!localLoading && macViewMode === 'list' &&
                   sortedLocalEntries.map((entry) => (
                     <button
                       type="button"
@@ -5152,30 +6078,51 @@ export function App(): JSX.Element {
                       key={entry.path}
                       draggable
                       className={`local-row ${selectedLocalPaths.has(entry.path) ? 'selected' : ''}`}
-                      onClick={(event) =>
-                        toggleLocalSelection(entry, event.metaKey || event.ctrlKey, event.shiftKey)
-                      }
+                      onClick={(event) => {
+                        toggleLocalSelection(entry, event.metaKey || event.ctrlKey, event.shiftKey);
+                        localBrowserRef.current?.focus();
+                      }}
                       onContextMenu={(event) => openMacContextMenu(event, entry)}
                       onDoubleClick={() => openLocalEntry(entry)}
                       onDragStart={(event) => startLocalEntryDrag(entry, event)}
                       title={entry.path}
                     >
-                      <FileIcon
-                        row={{
-                          key: entry.path,
-                          kind: entry.kind,
-                          name: entry.name,
-                          size: entry.size,
-                          modified: entry.modified,
-                          type: entry.type
-                        }}
-                      />
+                      <FileIcon row={browserRowForLocalEntry(entry)} />
                       <span className="local-name">{entry.name}</span>
                       <span className="local-modified">{formatDate(entry.modified)}</span>
                       <span className="local-kind">
                         {entry.kind === 'folder' ? 'Folder' : entry.type || extensionFor(entry.name)}
                       </span>
                       <span className="local-size">{entry.kind === 'folder' ? '—' : formatBytes(entry.size)}</span>
+                    </button>
+                  ))}
+                {!localLoading && macViewMode === 'grid' &&
+                  sortedLocalEntries.map((entry) => (
+                    <button
+                      type="button"
+                      role="gridcell"
+                      key={entry.path}
+                      draggable
+                      className={`file-tile local-file-tile ${entry.kind} ${selectedLocalPaths.has(entry.path) ? 'selected' : ''}`}
+                      onClick={(event) => {
+                        toggleLocalSelection(entry, event.metaKey || event.ctrlKey, event.shiftKey);
+                        localBrowserRef.current?.focus();
+                      }}
+                      onContextMenu={(event) => openMacContextMenu(event, entry)}
+                      onDoubleClick={() => openLocalEntry(entry)}
+                      onDragStart={(event) => startLocalEntryDrag(entry, event)}
+                      title={entry.path}
+                    >
+                      <span className={`file-tile-icon ${entry.kind}`}>
+                        <FileIcon row={browserRowForLocalEntry(entry)} />
+                      </span>
+                      <span className="file-tile-name">{entry.name}</span>
+                      <span className="file-tile-meta">
+                        {entry.kind === 'folder'
+                          ? 'Folder'
+                          : `${formatBytes(entry.size)} · ${entry.type || extensionFor(entry.name)}`}
+                      </span>
+                      <span className="file-tile-date">{formatDate(entry.modified)}</span>
                     </button>
                   ))}
                 {!localLoading && !localEntries.length && (
@@ -5335,6 +6282,16 @@ export function App(): JSX.Element {
                         Saved as {fileNameFromPath(job.destinationPath)} so nothing is overwritten.
                       </span>
                     )}
+                    {job.direction === 'upload' && job.collisionAction === 'keep-both' && job.uploadName && (
+                      <span className="queue-rename-note">
+                        Saving as {job.uploadName} so nothing is overwritten.
+                      </span>
+                    )}
+                    {job.direction === 'upload' && job.collisionAction === 'replace' && (
+                      <span className="queue-rename-note">
+                        The existing phone file stays in place until this copy is verified.
+                      </span>
+                    )}
                   </div>
                 </div>
                 <div className="progress-track">
@@ -5378,7 +6335,9 @@ export function App(): JSX.Element {
                       <X size={14} />
                     </button>
                   )}
-                  {!job.promiseId && (job.status === 'failed' || job.status === 'canceled') && (
+                  {!job.promiseId &&
+                    !(job.direction === 'upload' && job.collisionAction === 'replace') &&
+                    (job.status === 'failed' || job.status === 'canceled') && (
                     <button
                       className="icon-button"
                       title="Retry"
@@ -5402,9 +6361,115 @@ export function App(): JSX.Element {
             {!visibleQueueJobs.length && <div className="empty-note">Transfer queue is empty.</div>}
           </div>
         </aside>
-      </section>
+        </section>
+      )}
 
       {renderContextMenu()}
+
+      {localNameDialog && (
+        <div className="modal-backdrop" role="presentation">
+          <form
+            className="folder-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="local-name-dialog-title"
+            onSubmit={(event) => void submitLocalNameDialog(event)}
+          >
+            <div className="folder-dialog-header rename-dialog-header">
+              {localNameDialog.mode === 'new-folder' ? <FolderPlus size={18} /> : <Pencil size={18} />}
+              <h2 id="local-name-dialog-title">
+                {localNameDialog.mode === 'new-folder' ? 'New Mac folder' : `Rename Mac ${localNameDialog.target.kind}`}
+              </h2>
+            </div>
+            <label className="folder-name-field">
+              <span>Name</span>
+              <input
+                autoFocus
+                value={localItemName}
+                onFocus={(event) => localNameDialog.mode === 'rename' && event.currentTarget.select()}
+                onChange={(event) => {
+                  setLocalItemName(event.target.value);
+                  setLocalMutationError(null);
+                }}
+                disabled={localMutationBusy}
+              />
+            </label>
+            {localMutationError && (
+              <div className="folder-dialog-error" role="alert">
+                <AlertTriangle size={14} />
+                <span>{localMutationError}</span>
+              </div>
+            )}
+            <div className="folder-dialog-actions">
+              <button type="button" className="text-button" disabled={localMutationBusy} onClick={closeLocalNameDialog}>
+                Cancel
+              </button>
+              <button type="submit" className="primary-button" disabled={localMutationBusy}>
+                {localMutationBusy
+                  ? <Loader2 size={14} className="spin" />
+                  : localNameDialog.mode === 'new-folder'
+                    ? <FolderPlus size={14} />
+                    : <Pencil size={14} />}
+                <span>
+                  {localMutationBusy
+                    ? localNameDialog.mode === 'new-folder' ? 'Creating...' : 'Renaming...'
+                    : localNameDialog.mode === 'new-folder' ? 'Create' : 'Rename'}
+                </span>
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {renameDialogTarget && (
+        <div className="modal-backdrop" role="presentation">
+          <form
+            className="folder-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="rename-phone-item-title"
+            onSubmit={(event) => void renamePhoneItemFromDialog(event)}
+          >
+            <div className="folder-dialog-header rename-dialog-header">
+              <Pencil size={18} />
+              <h2 id="rename-phone-item-title">Rename phone {renameDialogTarget.kind}</h2>
+            </div>
+            <label className="folder-name-field">
+              <span>Name</span>
+              <input
+                autoFocus
+                value={renamePhoneName}
+                onFocus={(event) => event.currentTarget.select()}
+                onChange={(event) => {
+                  setRenamePhoneName(event.target.value);
+                  setRenamePhoneError(null);
+                }}
+                disabled={phoneMutationBusy}
+              />
+            </label>
+            {renamePhoneError && (
+              <div className="folder-dialog-error" role="alert">
+                <AlertTriangle size={14} />
+                <span>{renamePhoneError}</span>
+              </div>
+            )}
+            <div className="folder-dialog-actions">
+              <button
+                type="button"
+                className="text-button"
+                disabled={phoneMutationBusy}
+                onClick={closeRenamePhoneItemDialog}
+              >
+                Cancel
+              </button>
+              <button type="submit" className="primary-button" disabled={phoneMutationBusy}>
+                {phoneMutationBusy ? <Loader2 size={14} className="spin" /> : <Pencil size={14} />}
+                <span>{phoneMutationBusy ? 'Renaming...' : 'Rename'}</span>
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
 
       {newFolderDialogOpen && (
         <div className="modal-backdrop" role="presentation">

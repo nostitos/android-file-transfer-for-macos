@@ -32,6 +32,21 @@ assert.match(main, /reportProgress[\s\S]*folder-list:progress/, 'Main must forwa
 assert.match(app, /currentFolderProgressPercent/, 'The active folder banner must render an exact percent when available.');
 assert.match(styles, /folder-progress-fill\.determinate/, 'Determinate listing progress must not use the indeterminate animation.');
 assert.match(nativeHelper, /session_list_progress_callback/, 'The Samsung fallback must emit listing progress.');
+assert.match(
+  nativeHelper,
+  /if \(\*fallback_files == NULL\) \{\s*\*fallback_attempted = 0;/,
+  'A failed Samsung full-index scan must remain retryable in the same session.'
+);
+assert.match(
+  nativeHelper,
+  /Retry will try again without reconnecting\./,
+  'A failed Samsung index scan must explain that Retry does not require reconnecting.'
+);
+assert.doesNotMatch(
+  nativeHelper,
+  /Reconnect the phone before trying again\./,
+  'Folder-list failure must not instruct users to reconnect when the app can retry.'
+);
 
 assert.match(
   preload,
@@ -55,12 +70,6 @@ assert.match(
   main,
   /rejectQueuedCommands\(sessionQueue\)/,
   'Folder-list cancellation must remove queued normal list commands before they run later.'
-);
-
-assert.match(
-  main,
-  /rejectQueuedCommands\(adminSession\.queue\)/,
-  'Folder-list cancellation must remove queued protected list commands before they run later.'
 );
 
 assert.match(

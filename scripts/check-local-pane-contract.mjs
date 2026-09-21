@@ -45,7 +45,7 @@ assert.match(main, /ipcMain\.handle\('local:ensureDirectory'/, 'Main process mus
 assert.match(app, /const \[localEntries, setLocalEntries\]/, 'Renderer must keep local Mac entries in state.');
 assert.match(app, /const \[commonMacFolders, setCommonMacFolders\]/, 'Renderer must keep common Mac folder shortcuts in state.');
 assert.match(app, /Copy to Phone/, 'Renderer must expose a Copy to Phone action for local files.');
-assert.match(app, /window\.mtp\.listLocalDirectory\(\s*directoryPath,\s*options\.showHidden \?\? showHiddenFiles\s*\)/, 'Renderer must load local directories through IPC.');
+assert.match(app, /window\.mtp\.listLocalDirectory\(\s*directoryPath,\s*options\.showHidden \?\? macShowHiddenFiles\s*\)/, 'Renderer must load local directories with the Mac visibility preference.');
 assert.match(app, /window\.mtp\.getCommonMacFolders\(\)\.then\(setCommonMacFolders\)/, 'Renderer must load common Mac folders on startup.');
 assert.match(app, /window\.mtp\.ensureLocalDirectory\(directory\.path\)/, 'Renderer must preserve empty phone folders on Mac.');
 assert.match(app, /function startLocalEntryDrag/, 'Renderer must let Mac pane rows start native drags.');
@@ -83,12 +83,12 @@ assert.match(styles, /--mac-pane-width/, 'Workspace must use a persisted CSS var
 assert.match(styles, /grid-template-columns:\s*246px minmax\(420px, 1fr\) 8px minmax\(400px, var\(--mac-pane-width, 460px\)\)/, 'Workspace must reserve resizable desktop-width phone and Mac panes.');
 assert.match(styles, /\.pane-resizer\s*\{[\s\S]*cursor:\s*col-resize/, 'Pane divider must look and behave like a resize handle.');
 assert.match(styles, /grid-template-columns: 20px minmax\(120px, 1fr\) 84px 62px 56px/, 'Local rows must use stable Finder-style columns without horizontal scrolling.');
-assert.match(styles, /\.local-list\s*\{[\s\S]*overflow-x:\s*hidden/, 'Local Mac pane should not show a horizontal scrollbar in normal use.');
+assert.match(styles, /\.local-browser\s*\{[\s\S]*overflow-x:\s*hidden/, 'Local Mac pane should not show a horizontal scrollbar in normal use.');
 assert.match(styles, /\.local-column-header button/, 'Local column headers must be styled as compact sortable controls.');
 assert.match(styles, /\.local-column-header button\.active/, 'Active Mac sort column must be visually distinguishable.');
 assert.match(styles, /\.local-nav-buttons/, 'Mac navigation controls must have compact styling.');
 assert.match(styles, /\.local-breadcrumbs/, 'Mac breadcrumbs must have dedicated compact styling.');
-assert.match(styles, /\.local-pane\s*\{[\s\S]*grid-template-rows:\s*auto auto auto auto auto minmax\(0, 1fr\)/, 'Mac pane grid must reserve rows for title, folder picker, shortcuts, breadcrumbs, actions, and scrollable file list.');
+assert.match(styles, /\.local-pane\s*\{[\s\S]*grid-template-rows:\s*auto auto auto auto auto auto minmax\(0, 1fr\)/, 'Mac pane grid must reserve rows for title, folder picker, shortcuts, breadcrumbs, browser controls, actions, and the scrollable file view.');
 assert.match(styles, /\.queue-pane\s*\{[\s\S]*flex-direction:\s*column/, 'Right pane must stack the Mac browser above the transfer queue.');
 assert.match(styles, /\.queue-header\s*\{[\s\S]*flex:\s*1 1 360px/, 'Mac browser must receive the primary height in the right pane.');
 assert.match(styles, /\.queue-list\.empty\s*\{[\s\S]*flex:\s*0 0 auto/, 'Empty transfer history must not reserve space from the Mac browser.');

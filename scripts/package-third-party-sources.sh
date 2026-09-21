@@ -32,6 +32,8 @@ download_and_verify \
 cp "$CACHE_DIR/libusb-1.0.30.tar.bz2" "$STAGE/"
 cp "$CACHE_DIR/libmtp-1.1.23.tar.gz" "$STAGE/"
 cp "$ROOT/scripts/build-native-deps.sh" "$STAGE/"
+mkdir -p "$STAGE/patches"
+cp "$ROOT/patches/libmtp-1.1.23-no-usb-reset.patch" "$STAGE/patches/"
 cp "$ROOT/THIRD_PARTY_NOTICES.md" "$STAGE/"
 cp "$ROOT/ATTRIBUTION.md" "$STAGE/"
 cp "$ROOT/licenses/LGPL-2.1.txt" "$STAGE/"

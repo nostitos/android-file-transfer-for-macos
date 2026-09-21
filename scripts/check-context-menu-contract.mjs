@@ -52,10 +52,14 @@ for (const label of [
   'Stop Listing',
   'Parent Folder',
   'New Phone Folder',
+  'Rename',
+  'Delete Permanently...',
   'Check Phone Now',
   'Copy to Phone',
   'Move to',
   'Reveal in Finder',
+  'Move to Trash',
+  'New Mac Folder',
   'Refresh Mac Folder',
   'Choose Mac Folder',
   'Use Desktop'
@@ -75,11 +79,8 @@ assert.match(app, /copyLocalFilesToPhone\(localActionEntries, 'move'\)/, 'Mac co
 assert.match(app, /phoneActionFilesOnly/, 'Phone folder selections must not enable Move.');
 assert.match(app, /localActionFilesOnly/, 'Mac folder selections must not enable Move.');
 assert.match(app, /window\.mtp\.revealInFinder\(localContextEntry\.path\)/, 'Mac context menu must reveal rows in Finder.');
-assert.doesNotMatch(
-  app,
-  /<span>(Delete|Rename)\b/,
-  'Context menus must not expose standalone delete or rename.'
-);
+assert.match(app, /openRenamePhoneItemDialog\(phoneActionRows\[0\]\)/, 'Phone rename must use the guarded dialog.');
+assert.match(app, /deletePhoneRows\(phoneActionRows\)/, 'Phone delete must use the guarded main-process path.');
 
 assert.match(styles, /\.context-menu\s*\{/, 'Context menu must have dedicated styling.');
 assert.match(styles, /\.context-menu button\s*\{/, 'Context menu buttons must have compact row styling.');

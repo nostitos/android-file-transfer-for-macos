@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const ignoredDirectories = new Set([
   '.git', '.tmp', '.cache', '.native-deps', 'node_modules', 'out', 'release', 'resources',
-  'openmtp-upstream', 'android-file-transfer-linux', 'aft-build', 'transfer-test'
+  'openmtp-upstream', 'android-file-transfer-linux', 'aft-build', 'transfer-test', 'graphify-out'
 ]);
 const forbiddenPatterns = [
   /Mac Android Transfer/i,

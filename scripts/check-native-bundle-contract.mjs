@@ -28,9 +28,13 @@ function verifyCodeSignature(path) {
 }
 
 const packageJson = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'));
+const packageMacScript = packageJson.scripts?.['package:mac'] ?? '';
 const extraResources = packageJson.build?.extraResources ?? [];
 const nativeHelperSource = readFileSync(resolve(root, 'src/native/mtp-json.c'), 'utf8');
 const buildScript = readFileSync(resolve(root, 'scripts/build-native.mjs'), 'utf8');
+const mainSource = readFileSync(resolve(root, 'src/main/index.ts'), 'utf8');
+const packagedSmokeScript = readFileSync(resolve(root, 'scripts/smoke-packaged-app.sh'), 'utf8');
+const currentPackageSmokeScript = readFileSync(resolve(root, 'scripts/smoke-current-package.mjs'), 'utf8');
 
 assert.ok(existsSync(helperPath), 'Native helper must exist.');
 assert.ok(existsSync(filePromiseAddonPath), 'Native AppKit file-promise addon must exist.');
@@ -63,6 +67,39 @@ assert.match(
 );
 assert.match(filePromiseLinks, /AppKit\.framework/, 'File-promise addon must link AppKit.');
 assert.match(buildScript, /file-promise-drag\.node/, 'Native build must package the file-promise addon.');
+assert.match(
+  buildScript,
+  /NATIVE_BUILD_FOR_PACKAGE[\s\S]*\.native-deps[\s\S]*targetArch[\s\S]*check-macho\.mjs[\s\S]*allow-build-paths/,
+  'Packaging builds must select the repository architecture-scoped native dependencies.'
+);
+assert.match(
+  buildScript,
+  /PKG_CONFIG_LIBDIR/,
+  'Packaging builds must isolate pkg-config from ambient Homebrew metadata.'
+);
+assert.match(
+  packageMacScript,
+  /MACOSX_DEPLOYMENT_TARGET=12\.0 NATIVE_BUILD_FOR_PACKAGE=1 npm run build[\s\S]*smoke-current-package\.mjs --prepare[\s\S]*electron-builder[\s\S]*smoke-current-package\.mjs$/,
+  'Local macOS packaging must pin the declared deployment target, use prepared native dependencies, and bracket electron-builder with package smoke preparation and validation.'
+);
+assert.match(mainSource, /--file-promise-smoke/, 'The packaged app must expose a native addon load smoke mode.');
+assert.match(
+  packagedSmokeScript,
+  /--file-promise-smoke[\s\S]*PACKAGED_FILE_PROMISE_DRAG_OK/,
+  'The packaged smoke test must load the addon inside the signed Electron host.'
+);
+assert.match(currentPackageSmokeScript, /arch === 'arm64'.*\['mac-arm64'\].*\['mac', 'mac-x64'\]/s, 'Local package smoke must resolve both Apple Silicon and Intel outputs.');
+assert.match(currentPackageSmokeScript, /expectedArchitecture.*x86_64/s, 'Local package smoke must reject a wrong Intel executable architecture.');
+assert.match(
+  currentPackageSmokeScript,
+  /--prepare[\s\S]*rmSync[\s\S]*recursive: true[\s\S]*markerPath/,
+  'Local package smoke must clear current-architecture unpacked outputs and write a run marker before packaging.'
+);
+assert.match(
+  currentPackageSmokeScript,
+  /check-macho\.mjs[\s\S]*--root[\s\S]*appPath[\s\S]*--max-macos[\s\S]*minimumSystemVersion/,
+  'Local package smoke must validate Mach-O deployment targets in the exact app produced by the current packaging run.'
+);
 assert.match(
   helperLinks,
   /@loader_path\/\.\.\/lib\/libusb-1\.0\.0\.dylib/,

@@ -7,6 +7,31 @@ export type DeviceState =
   | 'connected'
   | 'error';
 
+export type MtpConnectionPhase =
+  | 'no-phone'
+  | 'file-transfer-off'
+  | 'opening'
+  | 'listing-storage'
+  | 'ready'
+  | 'needs-mode-reset'
+  | 'needs-replug'
+  | 'usb-busy'
+  | 'cancelled';
+
+export type MtpConnectionIssue =
+  | 'phone-not-responding'
+  | 'storage-unavailable'
+  | 'other-app-owns-usb'
+  | 'helper-unavailable'
+  | 'disconnected'
+  | 'cancelled'
+  | 'unknown';
+
+export interface MtpConnectionPhaseEvent {
+  phase: Extract<MtpConnectionPhase, 'opening' | 'listing-storage'>;
+  connectionId?: string;
+}
+
 export interface RawDevice {
   index: number;
   vendorId: number;
@@ -32,11 +57,15 @@ export interface DeviceStatus {
   rawDevices: RawDevice[];
   helperPath: string;
   logPath: string;
+  connectionPhase?: MtpConnectionPhase;
+  connectionIssue?: MtpConnectionIssue;
   sessionOpen?: boolean;
-  protectedSessionOpen?: boolean;
   sessionConnectionId?: string;
   sessionConnectionIds?: string[];
   stderr?: string;
+  // Name of the Mac app holding a macOS Image Capture session on the phone
+  // (for example Preview). Present only while that app keeps the phone busy.
+  usbOwnerApp?: string;
 }
 
 export interface MtpStorage {
@@ -70,7 +99,6 @@ export interface MtpDeviceInventory {
   vendor: string;
   product: string;
   connectionId: string;
-  protectedAccess?: boolean;
   storages: MtpStorage[];
   objects: MtpObject[];
 }
@@ -82,8 +110,11 @@ export interface InventoryResult {
   devices: MtpDeviceInventory[];
   helperPath: string;
   logPath: string;
-  protectedAccess?: boolean;
+  connectionPhase?: MtpConnectionPhase;
+  connectionIssue?: MtpConnectionIssue;
+  fileAccessUnavailable?: boolean;
   stderr?: string;
+  usbOwnerApp?: string;
 }
 
 export interface FolderListResult {
@@ -94,6 +125,9 @@ export interface FolderListResult {
   storageId: number;
   parentId: number;
   objects: MtpObject[];
+  connectionPhase?: MtpConnectionPhase;
+  connectionIssue?: MtpConnectionIssue;
+  fileAccessUnavailable?: boolean;
   helperPath: string;
   logPath: string;
   stderr?: string;
@@ -116,6 +150,7 @@ export interface LocalEntry {
   size: number;
   modified: number;
   type: string;
+  identity: LocalSourceIdentity;
 }
 
 export interface LocalDirectoryResult {
@@ -133,6 +168,47 @@ export interface LocalModifiedTimeResult {
   modified?: number;
 }
 
+export interface LocalMutationTarget {
+  path: string;
+  name: string;
+  kind: LocalEntryKind;
+  identity: LocalSourceIdentity;
+}
+
+export interface CreateLocalFolderRequest {
+  directoryPath: string;
+  name: string;
+}
+
+export interface RenameLocalItemRequest {
+  directoryPath: string;
+  target: LocalMutationTarget;
+  newName: string;
+}
+
+export interface LocalMutationResult {
+  ok: boolean;
+  message: string;
+  entry?: LocalEntry;
+}
+
+export interface TrashLocalItemsRequest {
+  directoryPath: string;
+  targets: LocalMutationTarget[];
+}
+
+export interface TrashLocalItemFailure {
+  target: LocalMutationTarget;
+  message: string;
+}
+
+export interface TrashLocalItemsResult {
+  ok: boolean;
+  message: string;
+  trashedPaths: string[];
+  failures: TrashLocalItemFailure[];
+}
+
 export interface TransferRequest {
   deviceIndex: number;
   deviceConnectionId: string;
@@ -146,6 +222,8 @@ export interface TransferRequest {
   operation?: TransferOperation;
 }
 
+export type TransferCollisionAction = 'none' | 'keep-both' | 'replace' | 'skip' | 'cancel';
+
 export interface UploadRequest {
   deviceIndex: number;
   deviceConnectionId: string;
@@ -154,7 +232,10 @@ export interface UploadRequest {
   sourcePath: string;
   name: string;
   size: number;
+  sourceIdentity: LocalSourceIdentity;
   operation?: TransferOperation;
+  existingDestination?: PhoneMutationTarget;
+  keepBothName?: string;
 }
 
 export interface CreateFolderRequest {
@@ -174,6 +255,59 @@ export interface CreateFolderResult {
   parentId: number;
   folderId: number;
   name: string;
+  helperPath: string;
+  logPath: string;
+  stderr?: string;
+}
+
+export interface PhoneMutationTarget {
+  objectId: number;
+  storageId: number;
+  parentId: number;
+  name: string;
+  kind: MtpObjectKind;
+  // File-only listing snapshot. Folder size/time metadata is not stable across MTP devices.
+  size?: number;
+  modified?: number;
+}
+
+export interface RenamePhoneItemRequest {
+  deviceIndex: number;
+  deviceConnectionId: string;
+  target: PhoneMutationTarget;
+  newName: string;
+}
+
+export interface RenamePhoneItemResult {
+  ok: boolean;
+  state: DeviceState;
+  message: string;
+  objectId: number;
+  actualName?: string;
+  verified?: boolean;
+  helperPath: string;
+  logPath: string;
+  stderr?: string;
+}
+
+export interface DeletePhoneItemsRequest {
+  deviceIndex: number;
+  deviceConnectionId: string;
+  targets: PhoneMutationTarget[];
+}
+
+export interface DeletePhoneItemFailure {
+  target: PhoneMutationTarget;
+  message: string;
+}
+
+export interface DeletePhoneItemsResult {
+  confirmed: boolean;
+  ok: boolean;
+  state: DeviceState;
+  message: string;
+  deletedObjectIds: number[];
+  failures: DeletePhoneItemFailure[];
   helperPath: string;
   logPath: string;
   stderr?: string;
@@ -209,6 +343,13 @@ export interface TransferJob {
   sourceIdentity?: LocalSourceIdentity;
   sourceRemovalStatus?: SourceRemovalStatus;
   sourceRemovalError?: string;
+  collisionAction?: Exclude<TransferCollisionAction, 'none' | 'cancel'>;
+  destinationIdentity?: LocalSourceIdentity;
+  originalName?: string;
+  uploadName?: string;
+  uploadStagingName?: string;
+  uploadBackupName?: string;
+  replacementTarget?: PhoneMutationTarget;
   name: string;
   size: number;
   modified?: number;
@@ -263,6 +404,16 @@ export type PhoneFilePromiseDragEvent =
 
 export interface MoveQueueResult {
   confirmed: boolean;
+  collisionAction: TransferCollisionAction;
+  conflictCount: number;
+  skippedCount: number;
+  jobs: TransferJob[];
+}
+
+export interface TransferQueueResult {
+  collisionAction: TransferCollisionAction;
+  conflictCount: number;
+  skippedCount: number;
   jobs: TransferJob[];
 }
 
@@ -279,17 +430,6 @@ export interface CommonMacFolder {
   path: string;
 }
 
-export interface AdminRecoveryResult {
-  ok: boolean;
-  state: DeviceState;
-  message: string;
-  helperPath: string;
-  logPath: string;
-  inventory?: InventoryResult;
-  stderr?: string;
-  rawDevice?: RawDevice;
-}
-
 export interface DiagnosticsCopyResult {
   ok: boolean;
   copied: boolean;
@@ -298,8 +438,27 @@ export interface DiagnosticsCopyResult {
   text: string;
 }
 
+export type AppUpdateCheckStatus = 'update-available' | 'up-to-date' | 'error';
+
+export interface AppUpdateCheckResult {
+  ok: boolean;
+  status: AppUpdateCheckStatus;
+  currentVersion: string;
+  latestVersion?: string;
+  releaseTag?: string;
+  checkedAt: string;
+  message: string;
+}
+
+export interface OpenUpdateReleaseResult {
+  ok: boolean;
+  message: string;
+}
+
 export type AppMenuCommand =
   | 'new-folder'
+  | 'rename-selected-item'
+  | 'delete-selected-items'
   | 'copy-to-queue'
   | 'copy-selection'
   | 'paste-selection'
@@ -308,6 +467,7 @@ export type AppMenuCommand =
   | 'select-all'
   | 'open-files'
   | 'open-log'
+  | 'check-for-updates'
   | 'focus-phone'
   | 'focus-mac'
   | 'view-list'
@@ -326,29 +486,37 @@ export interface MtpApi {
     storageId: number,
     parentId: number
   ) => Promise<FolderListResult>;
+  cancelConnectionAttempt: () => Promise<boolean>;
   cancelFolderListing: () => Promise<boolean>;
+  onConnectionPhase: (listener: (event: MtpConnectionPhaseEvent) => void) => () => void;
   onFolderListProgress: (listener: (progress: FolderListProgress) => void) => () => void;
   listLocalDirectory: (directoryPath?: string, showHiddenFiles?: boolean) => Promise<LocalDirectoryResult>;
   inspectLocalPath: (path: string) => Promise<LocalEntry | null>;
   ensureLocalDirectory: (directoryPath: string) => Promise<LocalDirectoryResult>;
+  createLocalFolder: (request: CreateLocalFolderRequest) => Promise<LocalMutationResult>;
+  renameLocalItem: (request: RenameLocalItemRequest) => Promise<LocalMutationResult>;
+  trashLocalItems: (request: TrashLocalItemsRequest) => Promise<TrashLocalItemsResult>;
   setLocalModifiedTime: (path: string, modified: number) => Promise<LocalModifiedTimeResult>;
   getCommonMacFolders: () => Promise<CommonMacFolder[]>;
   chooseDestination: () => Promise<DestinationResult>;
   getDesktopDestination: () => Promise<string>;
   getPathForFile: (file: File) => string;
-  startDownloads: (requests: TransferRequest[]) => Promise<TransferJob[]>;
-  startUploads: (requests: UploadRequest[]) => Promise<TransferJob[]>;
+  startDownloads: (requests: TransferRequest[]) => Promise<TransferQueueResult>;
+  startUploads: (requests: UploadRequest[]) => Promise<TransferQueueResult>;
   startMoveDownloads: (requests: TransferRequest[]) => Promise<MoveQueueResult>;
   startMoveUploads: (requests: UploadRequest[]) => Promise<MoveQueueResult>;
   createFolder: (request: CreateFolderRequest) => Promise<CreateFolderResult>;
+  renamePhoneItem: (request: RenamePhoneItemRequest) => Promise<RenamePhoneItemResult>;
+  deletePhoneItems: (request: DeletePhoneItemsRequest) => Promise<DeletePhoneItemsResult>;
   startPhoneFilePromiseDrag: (request: PhoneFilePromiseDragRequest) => void;
   startLocalFileDrag: (filePaths: string[]) => void;
   cancelTransfer: (jobId: string) => Promise<TransferJob | null>;
   retryTransfer: (jobId: string) => Promise<TransferJob | null>;
   revealInFinder: (path: string) => Promise<void>;
-  recoverWithAdmin: () => Promise<AdminRecoveryResult>;
   openLog: () => Promise<void>;
   copyDiagnostics: () => Promise<DiagnosticsCopyResult>;
+  checkForUpdates: (interactive?: boolean) => Promise<AppUpdateCheckResult>;
+  openUpdateRelease: (releaseTag: string) => Promise<OpenUpdateReleaseResult>;
   onTransferEvent: (callback: (event: TransferEvent) => void) => () => void;
   onPhoneFilePromiseDragEvent: (callback: (event: PhoneFilePromiseDragEvent) => void) => () => void;
   onAppMenuCommand: (callback: (command: AppMenuCommand) => void) => () => void;

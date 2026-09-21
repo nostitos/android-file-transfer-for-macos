@@ -6,54 +6,69 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  net,
   screen,
   shell,
+  type MessageBoxOptions,
   type MenuItemConstructorOptions,
   type OpenDialogOptions
 } from 'electron';
 import { execFile, execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import {
   appendFileSync,
-  chmodSync,
   closeSync,
-  copyFileSync,
-  cpSync,
-  createWriteStream,
   existsSync,
   fstatSync,
   lstatSync,
   mkdirSync,
-  mkdtempSync,
   openSync,
   readSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   statfsSync,
   utimesSync,
   writeFileSync
 } from 'node:fs';
-import type { WriteStream } from 'node:fs';
 import { access, constants } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { androidUsbFallbackKey, parseAndroidUsbDevicesFromIoreg } from './androidUsb';
-import { publishTemporaryFile } from './atomicDownload';
+import { findMacMtpCameraOwner } from './macMtpCamera';
+import {
+  classifyMtpConnectionIssue,
+  connectionPhaseForIssue,
+  MTP_CONNECTION_WATCHDOG_MS
+} from './mtpConnectionPolicy';
+import {
+  fileIdentitySnapshot,
+  publishTemporaryFile,
+  replaceTemporaryFile
+} from './atomicDownload';
 import { removeVerifiedLocalMoveSource } from './localMoveSource';
+import { publishStagedPhoneReplacement } from './phoneReplacement';
 import {
   deviceConnectionId as buildDeviceConnectionId,
   stableDeviceIdentity
 } from '../shared/deviceIdentity';
+import { encodePhoneCommandName, validatePhoneItemName } from '../shared/phoneMutation';
+import { validateLocalItemName } from '../shared/localMutation';
+import { normalizeSemanticVersion, selectLatestRelease, type ReleaseCandidate } from '../shared/appUpdate';
+import { keepBothPhoneName, temporaryPhoneTransferName } from '../shared/transferCollision';
 import type {
-  AdminRecoveryResult,
   AppMenuCommand,
+  AppUpdateCheckResult,
   CommonMacFolder,
+  CreateLocalFolderRequest,
   CreateFolderRequest,
   CreateFolderResult,
+  DeletePhoneItemFailure,
+  DeletePhoneItemsRequest,
+  DeletePhoneItemsResult,
   DiagnosticsCopyResult,
   DestinationResult,
   DeviceStatus,
@@ -63,38 +78,69 @@ import type {
   LocalDirectoryResult,
   LocalEntry,
   LocalModifiedTimeResult,
+  LocalMutationResult,
+  LocalMutationTarget,
   LocalSourceIdentity,
   MtpDeviceInventory,
+  MtpConnectionIssue,
+  MtpConnectionPhaseEvent,
+  MtpConnectionPhase,
   MoveQueueResult,
+  OpenUpdateReleaseResult,
   PhoneFilePromiseDragEvent,
   PhoneFilePromiseDragItem,
   PhoneFilePromiseDragRequest,
+  PhoneMutationTarget,
   RawDevice,
+  RenamePhoneItemRequest,
+  RenamePhoneItemResult,
+  RenameLocalItemRequest,
+  TrashLocalItemFailure,
+  TrashLocalItemsRequest,
+  TrashLocalItemsResult,
   TransferEvent,
+  TransferCollisionAction,
   TransferJob,
   TransferOperation,
+  TransferQueueResult,
   TransferRequest,
   UploadRequest
 } from '../shared/types';
 
 const currentDir = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
+const APP_NAME = 'Android File Transfer for macOS';
+const IS_DEVELOPMENT_RUNTIME =
+  process.env.NODE_ENV_ELECTRON_VITE === 'development' || Boolean(process.env.ELECTRON_RENDERER_URL);
+const MTP_DIAGNOSTIC_DEBUG = process.env.MAC_ANDROID_TRANSFER_MTP_DEBUG === '1';
 const MAC_CAMERA_SERVICE_NAMES = ['icdd', 'ptpcamerad', 'mscamerad-xpc'];
 const RAW_DEVICE_MISSING_SESSION_GRACE_MS = 12_000;
-const ADMIN_SESSION_RECONNECT_TTL_MS = 10 * 60 * 1000;
-const NORMAL_MTP_SESSION_OPEN_TIMEOUT_MS = 45_000;
-const ADMIN_MTP_SESSION_OPEN_TIMEOUT_MS = 240_000;
-const ADMIN_MTP_OPEN_ATTEMPT_TIMEOUT_SECONDS = 70;
-const ADMIN_MTP_OPEN_MAX_ATTEMPTS = 3;
+const OPENING_DEVICE_MISSING_GRACE_MS = 500;
+const USB_CONNECTION_SETTLE_MS = 100;
+const MTP_ROOT_PARENT_ID = 0xffffffff;
+const PHONE_FILES_UNAVAILABLE_MESSAGE =
+  'The phone connection is open, but its folders are not available yet. Keep the phone unlocked, tap Allow if asked, then try again.';
+const MTP_SESSION_EXIT_KILL_AFTER_MS = 4_000;
 const TRANSFER_COMMAND_IDLE_TIMEOUT_MS = 30 * 60_000;
 const MAX_PROMISED_PHONE_FILES = 20_000;
+const MAX_PHONE_MUTATION_ITEMS = 1_000;
 const MAX_PROMISED_PHONE_FOLDERS = 5_000;
+const GITHUB_RELEASES_API =
+  'https://api.github.com/repos/nostitos/android-file-transfer-for-macos/releases?per_page=20';
+const GITHUB_RELEASES_WEB =
+  'https://github.com/nostitos/android-file-transfer-for-macos/releases/tag/';
+const UPDATE_CHECK_TIMEOUT_MS = 12_000;
+const UPDATE_RESPONSE_MAX_BYTES = 512 * 1024;
 let mainWindow: BrowserWindow | null = null;
 const transferJobs = new Map<string, TransferJob>();
 let activeJobId: string | null = null;
 let activeWasCanceled = false;
-let activeTransferUsesAdminSession = false;
 let pendingPromisePlanningCount = 0;
+let phoneMutationInProgress = false;
+let localMutationInProgress = false;
+let updateCheckInFlight: Promise<AppUpdateCheckResult> | null = null;
+
+app.setName(APP_NAME);
 
 interface NativePromiseDragEvent {
   type: 'write' | 'drag-ended' | 'internal-hover';
@@ -155,6 +201,7 @@ interface SessionPayload {
   sent?: number;
   total?: number;
   objectId?: number;
+  actualName?: string;
   verified?: boolean;
   destination?: string;
   bus?: number;
@@ -183,6 +230,8 @@ let sessionRawKey: string | null = null;
 let pendingSessionRawKey: string | null = null;
 let sessionConnectionId: string | null = null;
 let pendingSessionConnectionId: string | null = null;
+let sessionDeviceIdentityKey: string | null = null;
+let pendingSessionDeviceIdentityKey: string | null = null;
 let lastRawDevices: RawDevice[] = [];
 let sessionReady: Promise<void> | null = null;
 let sessionReadyResolve: (() => void) | null = null;
@@ -195,57 +244,17 @@ let activeSessionCommand: SessionCommand | null = null;
 const sessionQueue: SessionCommand[] = [];
 let lastAndroidUsbFallbackKey: string | null = null;
 let rawDevicesMissingSince: number | null = null;
+let openingDeviceMissingSince: number | null = null;
+const rawDeviceConnectionFirstSeenAt = new Map<string, number>();
 
-interface AdminSessionState {
-  deviceIndex: number;
-  connectionId: string;
-  rawKey: string;
-  deviceIdentityKey: string;
-  usbSessionId: string | null;
+interface LegacyPrivilegedSessionManifest {
   stageRoot: string;
-  stagedHelper: string;
-  runnerPath: string;
-  inputPath: string;
-  outputPath: string;
   pidPath: string;
   stopPath: string;
-  expirePath: string;
   processPid: number | null;
-  input: WriteStream | null;
-  outputOffset: number;
-  outputBuffer: string;
-  stderrBuffer: string;
-  isReady: boolean;
-  ready: Promise<void>;
-  readyResolve: (() => void) | null;
-  readyReject: ((error: Error) => void) | null;
-  readyTimer: ReturnType<typeof setTimeout> | null;
-  pollTimer: ReturnType<typeof setInterval> | null;
-  activeCommand: SessionCommand | null;
-  queue: SessionCommand[];
 }
 
-interface AdminSessionManifest {
-  version: 3;
-  deviceIndex: number;
-  connectionId: string;
-  rawKey: string;
-  deviceIdentityKey?: string;
-  usbSessionId?: string | null;
-  stageRoot: string;
-  stagedHelper: string;
-  runnerPath: string;
-  inputPath: string;
-  outputPath: string;
-  pidPath: string;
-  stopPath: string;
-  expirePath: string;
-  processPid: number | null;
-  createdAt: number;
-  expiresAt: number;
-}
-
-let adminSession: AdminSessionState | null = null;
+let mtpSessionTeardown: Promise<void> | null = null;
 
 function getLogPath(): string {
   const logsDir = join(app.getPath('userData'), 'logs');
@@ -256,6 +265,32 @@ function getLogPath(): string {
 function appendLog(message: string): void {
   const timestamp = new Date().toISOString();
   appendFileSync(getLogPath(), `[${timestamp}] ${message}\n`, 'utf8');
+}
+
+// A phone that keeps answering the storage question the same way produces the
+// same log line on every retry. Write it once, then summarize repeats, so a
+// long wait does not grow the log by megabytes and the next real change is
+// easy to find. A different message for the same key still logs immediately.
+const throttledLogState = new Map<string, { lastAt: number; suppressed: number }>();
+const THROTTLED_LOG_INTERVAL_MS = 30_000;
+
+function appendThrottledLog(message: string): void {
+  const now = Date.now();
+  const state = throttledLogState.get(message);
+  if (state && now - state.lastAt < THROTTLED_LOG_INTERVAL_MS) {
+    state.suppressed += 1;
+    return;
+  }
+  if (throttledLogState.size > 200) {
+    throttledLogState.clear();
+  }
+  const suppressed = state?.suppressed ?? 0;
+  throttledLogState.set(message, { lastAt: now, suppressed: 0 });
+  appendLog(
+    suppressed
+      ? `${message} (same answer repeated ${suppressed} more time${suppressed === 1 ? '' : 's'} since the previous line)`
+      : message
+  );
 }
 
 function removeLegacyPrecopyDirectory(): void {
@@ -273,7 +308,7 @@ function removeLegacyPrecopyDirectory(): void {
 }
 
 function getBridgePath(): string {
-  if (app.isPackaged) {
+  if (app.isPackaged && !IS_DEVELOPMENT_RUNTIME) {
     return join(process.resourcesPath, 'bin', 'mtp-json');
   }
 
@@ -281,7 +316,7 @@ function getBridgePath(): string {
 }
 
 function getFilePromiseDragAddonPath(): string {
-  if (app.isPackaged) {
+  if (app.isPackaged && !IS_DEVELOPMENT_RUNTIME) {
     return join(process.resourcesPath, 'bin', 'file-promise-drag.node');
   }
   return resolve(process.cwd(), 'resources/bin/file-promise-drag.node');
@@ -388,26 +423,234 @@ function macCameraServiceHint(): string | null {
   return `macOS camera/import services are running: ${services.join(', ')}. Close Photos or Image Capture if either app is trying to use the phone.`;
 }
 
+function readMacMtpInterfaces(): Promise<string> {
+  if (process.platform !== 'darwin') {
+    return Promise.resolve('');
+  }
+
+  return new Promise((resolvePromise) => {
+    execFile(
+      'ioreg',
+      ['-p', 'IOService', '-r', '-l', '-c', 'IOUSBHostInterface'],
+      { maxBuffer: 1024 * 1024 * 10, timeout: 2500 },
+      (error, stdout) => {
+        if (error) {
+          appendLog(`MTP interface ownership check failed: ${error.message}`);
+          resolvePromise('');
+          return;
+        }
+        resolvePromise(stdout);
+      }
+    );
+  });
+}
+
+function verifiedUserCameraProcess(pid: number): boolean {
+  try {
+    const output = execFileSync('/bin/ps', ['-p', String(pid), '-o', 'uid=', '-o', 'comm='], {
+      encoding: 'utf8',
+      timeout: 1000,
+      maxBuffer: 16 * 1024
+    }).trim();
+    const match = output.match(/^(\d+)\s+(.+)$/);
+    const currentUid = process.getuid?.();
+    return !!match &&
+      currentUid !== undefined &&
+      Number.parseInt(match[1], 10) === currentUid &&
+      basename(match[2].trim()) === 'ptpcamerad';
+  } catch {
+    return false;
+  }
+}
+
+const CAMERA_OWNER_RELEASE_DEADLINE_MS = 1500;
+const CAMERA_OWNER_RELEASE_POLL_MS = 100;
+
+// ptpcamerad only runs while some Mac app holds an Image Capture device
+// session. When it comes straight back after a release, that client app is
+// the real owner of the phone: each of its reconnects resets the phone, so the
+// phone never answers anyone. The unified log names the client, so the app
+// can tell the user exactly which app to quit instead of "still trying".
+const MAC_CAMERA_CLIENT_LOG_WINDOW = '45s';
+const MAC_CAMERA_CLIENT_DETECT_INTERVAL_MS = 20_000;
+const MAC_CAMERA_CLIENT_TTL_MS = 3 * 60_000;
+const MAC_CAMERA_RELAUNCH_WINDOW_MS = 2 * 60_000;
+const MAC_CAMERA_CLIENT_NAMES: Record<string, string> = {
+  'com.apple.Preview': 'Preview',
+  'com.apple.Photos': 'Photos',
+  'com.apple.Image_Capture': 'Image Capture',
+  'com.apple.iBooksX': 'Books',
+  'com.apple.PhotoBooth': 'Photo Booth'
+};
+let macCameraClient: { bundleId: string; appName: string; detectedAt: number } | null = null;
+let macCameraClientDetection: Promise<void> | null = null;
+let lastMacCameraClientDetectAt = 0;
+let lastReleasedCameraOwner: { pid: number; at: number } | null = null;
+
+function macCameraClientAppName(bundleId: string): string {
+  const known = MAC_CAMERA_CLIENT_NAMES[bundleId];
+  if (known) {
+    return known;
+  }
+  const tail = bundleId.split('.').pop() || bundleId;
+  return tail.replace(/[_-]+/g, ' ');
+}
+
+function currentMacCameraClientApp(): string | undefined {
+  if (!macCameraClient || Date.now() - macCameraClient.detectedAt > MAC_CAMERA_CLIENT_TTL_MS) {
+    return undefined;
+  }
+  return macCameraClient.appName;
+}
+
+function clearMacCameraClient(reason: string): void {
+  if (macCameraClient) {
+    appendLog(`${macCameraClient.appName} no longer blocks the phone (${reason})`);
+  }
+  macCameraClient = null;
+  lastReleasedCameraOwner = null;
+}
+
+function detectMacCameraClient(trigger: string): Promise<void> {
+  if (process.platform !== 'darwin') {
+    return Promise.resolve();
+  }
+  if (macCameraClientDetection) {
+    return macCameraClientDetection;
+  }
+  const now = Date.now();
+  if (now - lastMacCameraClientDetectAt < MAC_CAMERA_CLIENT_DETECT_INTERVAL_MS) {
+    return Promise.resolve();
+  }
+  lastMacCameraClientDetectAt = now;
+
+  macCameraClientDetection = new Promise<void>((resolvePromise) => {
+    execFile(
+      '/usr/bin/log',
+      [
+        'show',
+        '--last',
+        MAC_CAMERA_CLIENT_LOG_WINDOW,
+        '--style',
+        'compact',
+        '--predicate',
+        'process == "ptpcamerad"'
+      ],
+      { maxBuffer: 1024 * 1024 * 32, timeout: 8000 },
+      (error, stdout) => {
+        macCameraClientDetection = null;
+        if (error) {
+          appendLog(`macOS camera client lookup failed (${trigger}): ${error.message}`);
+          resolvePromise();
+          return;
+        }
+        let bundleId: string | null = null;
+        const pattern = /requestStart \| Process: ([A-Za-z0-9._-]+)/g;
+        for (let match = pattern.exec(stdout); match; match = pattern.exec(stdout)) {
+          bundleId = match[1];
+        }
+        if (!bundleId) {
+          appendLog(`macOS camera import is active but no client app was named in the last ${MAC_CAMERA_CLIENT_LOG_WINDOW} (${trigger})`);
+          if (macCameraClient) {
+            clearMacCameraClient('no client app named in the recent camera import log');
+          }
+          resolvePromise();
+          return;
+        }
+        const appName = macCameraClientAppName(bundleId);
+        if (macCameraClient?.bundleId !== bundleId) {
+          appendLog(
+            `${appName} (${bundleId}) holds a macOS Image Capture session on the phone; every reconnect resets the phone, so it will not answer until ${appName} is quit (${trigger})`
+          );
+        }
+        macCameraClient = { bundleId, appName, detectedAt: Date.now() };
+        resolvePromise();
+      }
+    );
+  });
+  return macCameraClientDetection;
+}
+
+// One bounded, scoped handoff: release the verified same-user ptpcamerad owner of
+// this exact phone interface and wait for the kernel to drop the exclusive claim.
+// No USB reset and no unbounded kill loop; if macOS reclaims first, the bounded
+// connection attempt reports that the USB interface is busy.
+async function releaseMacMtpCameraOwnerAndWait(rawDevice: RawDevice): Promise<boolean> {
+  const deadline = Date.now() + CAMERA_OWNER_RELEASE_DEADLINE_MS;
+  let releasedPid: number | null = null;
+
+  for (;;) {
+    const ioregOutput = await readMacMtpInterfaces();
+    const owner = ioregOutput ? findMacMtpCameraOwner(ioregOutput, rawDevice) : null;
+    if (!owner) {
+      if (macCameraClient && releasedPid === null) {
+        // Nobody was holding the interface on this attempt, so the named app
+        // has let go; stop telling the user to quit it.
+        clearMacCameraClient('macOS camera import is no longer holding the phone');
+      }
+      return true;
+    }
+
+    if (!verifiedUserCameraProcess(owner.pid)) {
+      return false;
+    }
+
+    if (owner.pid !== releasedPid) {
+      const relaunchedSinceLastRelease =
+        !!lastReleasedCameraOwner &&
+        lastReleasedCameraOwner.pid !== owner.pid &&
+        Date.now() - lastReleasedCameraOwner.at < MAC_CAMERA_RELAUNCH_WINDOW_MS;
+      if (relaunchedSinceLastRelease) {
+        void detectMacCameraClient('ptpcamerad relaunched after release');
+      }
+      try {
+        process.kill(owner.pid, 'SIGKILL');
+        releasedPid = owner.pid;
+        lastReleasedCameraOwner = { pid: owner.pid, at: Date.now() };
+        appendLog(
+          `released macOS camera import ownership of MTP interface for ${rawDeviceConnectionId(rawDevice)} (pid ${owner.pid})`
+        );
+      } catch (error) {
+        const nodeError = error as NodeJS.ErrnoException;
+        if (nodeError.code !== 'ESRCH') {
+          appendLog(`unable to release macOS camera import ownership: ${nodeError.message || String(error)}`);
+          return false;
+        }
+      }
+    }
+
+    if (Date.now() >= deadline) {
+      return false;
+    }
+
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, CAMERA_OWNER_RELEASE_POLL_MS));
+  }
+}
+
 function bridgeFailureHint(stderr: string, timedOut: boolean): string | null {
   const normalized = stderr.toLowerCase();
-  const sessionOpenFailed =
+  const phoneDidNotAnswer =
     normalized.includes('ptp_error_io') ||
-    normalized.includes('failed to open session') ||
+    normalized.includes('failed to open session');
+  const usbBusy =
     normalized.includes('libusb_claim_interface') ||
-    normalized.includes('libusb_detach_kernel_driver') ||
-    normalized.includes('usb device capture');
+    normalized.includes('libusb_error_access') ||
+    normalized.includes('libusb_error_busy') ||
+    normalized.includes('another process has device opened for exclusive access');
 
-  if (sessionOpenFailed) {
+  if (usbBusy) {
     const serviceHint = macCameraServiceHint();
     return [
-      'The phone was detected, but it did not open its files to this Mac.',
-      'If the app shows Open files, use it to start one protected phone-file session.',
+      'Another Mac app is using the phone USB connection.',
       serviceHint,
-      'Keep the phone unlocked, tap any data-access prompt, switch USB mode away from File Transfer and back, and close other transfer or photo apps.',
-      'On macOS, Image Capture or another USB service may be holding the phone until the USB connection is reset.'
+      'Close other photo or Android transfer apps, then try again.'
     ]
       .filter(Boolean)
       .join(' ');
+  }
+
+  if (phoneDidNotAnswer) {
+    return 'The phone did not answer the file request. Keep it unlocked and in File transfer while the app tries again.';
   }
 
   if (timedOut) {
@@ -441,6 +684,60 @@ function rawDeviceIdentityKey(device: RawDevice): string {
 
 function rawDeviceConnectionId(device: RawDevice): string {
   return device.connectionId || buildDeviceConnectionId(device);
+}
+
+function rememberRawDeviceConnections(devices: RawDevice[]): void {
+  const now = Date.now();
+  const visibleConnectionIds = new Set(devices.map(rawDeviceConnectionId));
+  for (const connectionId of visibleConnectionIds) {
+    if (!rawDeviceConnectionFirstSeenAt.has(connectionId)) {
+      rawDeviceConnectionFirstSeenAt.set(connectionId, now);
+    }
+  }
+  for (const connectionId of rawDeviceConnectionFirstSeenAt.keys()) {
+    if (!visibleConnectionIds.has(connectionId)) {
+      rawDeviceConnectionFirstSeenAt.delete(connectionId);
+    }
+  }
+}
+
+async function waitForUsbConnectionToSettle(connectionId: string): Promise<void> {
+  if (!connectionIdIsUsbSessionScoped(connectionId)) {
+    return;
+  }
+  const firstSeenAt = rawDeviceConnectionFirstSeenAt.get(connectionId);
+  if (firstSeenAt === undefined) {
+    return;
+  }
+  const remainingMs = firstSeenAt + USB_CONNECTION_SETTLE_MS - Date.now();
+  if (remainingMs <= 0) {
+    return;
+  }
+  appendLog(`waiting ${remainingMs}ms for new USB connection ${connectionId} to settle before opening MTP`);
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, remainingMs));
+}
+
+// A connection ID that carries a macOS USB session ID identifies one specific
+// enumeration of the phone. When that ID changes, macOS re-enumerated the
+// device (USB mode switch, unlock, or a phone-side reset) and any helper that
+// opened the previous enumeration now holds a handle to hardware that no
+// longer exists. Its answers are stale, so the session must be reopened.
+function connectionIdIsUsbSessionScoped(connectionId: string | null | undefined): boolean {
+  return typeof connectionId === 'string' && connectionId.includes('@usb:');
+}
+
+function openSessionServesConnection(connectionId: string, deviceIdentityKey: string): boolean {
+  if (!sessionProcess || !sessionReady) {
+    return false;
+  }
+  if (sessionConnectionId === connectionId) {
+    return true;
+  }
+  return (
+    sessionDeviceIdentityKey === deviceIdentityKey &&
+    !connectionIdIsUsbSessionScoped(sessionConnectionId) &&
+    !connectionIdIsUsbSessionScoped(connectionId)
+  );
 }
 
 function readyPayloadMatchesConnection(
@@ -502,15 +799,6 @@ function rawDeviceUsbSessionId(device: Pick<RawDevice, 'usbSessionId'> | null | 
     : null;
 }
 
-function usbSessionChanged(previousSessionId: string | null | undefined, rawDevice: RawDevice): boolean {
-  const nextSessionId = rawDeviceUsbSessionId(rawDevice);
-  return !!previousSessionId && !!nextSessionId && previousSessionId !== nextSessionId;
-}
-
-function findVisibleDeviceForAdminSession(session: AdminSessionState, rawDevices: RawDevice[]): RawDevice | null {
-  return rawDevices.find((device) => rawDeviceConnectionId(device) === session.connectionId) ?? null;
-}
-
 function detectAndroidUsbDevices(): Promise<RawDevice[]> {
   return new Promise((resolvePromise) => {
     execFile(
@@ -548,11 +836,12 @@ async function androidUsbFallbackStatus(baseStatus: DeviceStatus): Promise<Devic
 
   return {
     ...baseStatus,
-    ok: false,
-    state: 'connect-error',
+    ok: hasMtpUsbDevice,
+    state: hasMtpUsbDevice ? 'connected' : 'connect-error',
     message: hasMtpUsbDevice
-      ? 'Phone is visible in File Transfer mode, but its folders are not open yet. Use Open files to start one protected phone-file session.'
+      ? 'Phone is visible in File Transfer mode. Opening its files automatically.'
       : 'Phone is connected by USB, but File transfer is not active. Unlock the phone, open the USB notification, and choose File transfer or Transferring files.',
+    connectionPhase: hasMtpUsbDevice ? 'opening' : 'file-transfer-off',
     deviceCount: usbDevices.length,
     rawDevices: usbDevices
   };
@@ -599,18 +888,6 @@ async function enrichRawDevicesWithAndroidUsbMetadata(rawDevices: RawDevice[]): 
   });
 }
 
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, "'\\''")}'`;
-}
-
-function sha256File(filePath: string): string {
-  return createHash('sha256').update(readFileSync(filePath)).digest('hex');
-}
-
-function appleScriptString(value: string): string {
-  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
-}
-
 function readPidFile(pidPath: string): number | null {
   try {
     const raw = readFileSync(pidPath, 'utf8').trim();
@@ -621,130 +898,76 @@ function readPidFile(pidPath: string): number | null {
   }
 }
 
-function isProcessAlive(pid: number | null): boolean {
-  if (!pid) {
-    return false;
+function trackMtpSessionTeardown(teardown: Promise<void>): Promise<void> {
+  const previousTeardown = mtpSessionTeardown;
+  const combinedTeardown = previousTeardown
+    ? Promise.all([previousTeardown, teardown]).then(() => undefined)
+    : teardown;
+  mtpSessionTeardown = combinedTeardown;
+
+  void combinedTeardown.then(() => {
+    if (mtpSessionTeardown !== combinedTeardown) {
+      return;
+    }
+    mtpSessionTeardown = null;
+    processTransferQueue();
+  });
+
+  return combinedTeardown;
+}
+
+async function waitForMtpSessionTeardown(): Promise<void> {
+  while (mtpSessionTeardown) {
+    await mtpSessionTeardown;
   }
+}
+
+function cleanupLegacyPrivilegedSession(): void {
+  const manifestPath = join(app.getPath('userData'), 'sessions', 'protected-mtp-session.json');
+  let manifest: LegacyPrivilegedSessionManifest | null = null;
 
   try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    const nodeError = error as NodeJS.ErrnoException;
-    return nodeError.code === 'EPERM';
-  }
-}
+    const value = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
+    const stageRoot = typeof value.stageRoot === 'string' ? resolve(value.stageRoot) : '';
+    const pidPath = typeof value.pidPath === 'string' ? resolve(value.pidPath) : '';
+    const stopPath = typeof value.stopPath === 'string' ? resolve(value.stopPath) : '';
+    const processPid =
+      typeof value.processPid === 'number' && Number.isInteger(value.processPid) && value.processPid > 0
+        ? value.processPid
+        : null;
+    const expectedPrefix = '/private/var/tmp/androidFileTransferForMacOS-protected-';
 
-function getAdminSessionManifestPath(): string {
-  const sessionDir = join(app.getPath('userData'), 'sessions');
-  mkdirSync(sessionDir, { recursive: true });
-  return join(sessionDir, 'protected-mtp-session.json');
-}
-
-function parseAdminSessionManifest(value: unknown): AdminSessionManifest | null {
-  if (!value || typeof value !== 'object') {
-    return null;
-  }
-
-  const manifest = value as Record<string, unknown>;
-  const stringKeys = [
-    'rawKey',
-    'stageRoot',
-    'stagedHelper',
-    'runnerPath',
-    'inputPath',
-    'outputPath',
-    'pidPath',
-    'stopPath',
-    'expirePath'
-  ];
-  if (
-    manifest.version !== 3 ||
-    typeof manifest.deviceIndex !== 'number' ||
-    !Number.isInteger(manifest.deviceIndex) ||
-    manifest.deviceIndex < 0 ||
-    typeof manifest.connectionId !== 'string' ||
-    manifest.connectionId.length === 0 ||
-    (typeof manifest.deviceIdentityKey !== 'string' && typeof manifest.deviceIdentityKey !== 'undefined') ||
-    (typeof manifest.usbSessionId !== 'string' &&
-      manifest.usbSessionId !== null &&
-      typeof manifest.usbSessionId !== 'undefined') ||
-    typeof manifest.createdAt !== 'number' ||
-    typeof manifest.expiresAt !== 'number' ||
-    (typeof manifest.processPid !== 'number' && manifest.processPid !== null)
-  ) {
-    return null;
-  }
-
-  for (const key of stringKeys) {
-    if (typeof manifest[key] !== 'string' || !(manifest[key] as string).length) {
-      return null;
+    if (
+      stageRoot.startsWith(expectedPrefix) &&
+      pidPath.startsWith(`${stageRoot}/`) &&
+      stopPath.startsWith(`${stageRoot}/`)
+    ) {
+      manifest = { stageRoot, pidPath, stopPath, processPid };
     }
-  }
-
-  const stageRoot = resolve(manifest.stageRoot as string);
-  const protectedRootPrefix = '/private/var/tmp/androidFileTransferForMacOS-protected-';
-  if (!stageRoot.startsWith(protectedRootPrefix) || stageRoot !== (manifest.stageRoot as string)) {
-    return null;
-  }
-  for (const key of stringKeys.filter((key) => key !== 'stageRoot')) {
-    const filePath = resolve(manifest[key] as string);
-    if (!filePath.startsWith(`${stageRoot}/`)) {
-      return null;
-    }
-  }
-
-  return manifest as unknown as AdminSessionManifest;
-}
-
-function readAdminSessionManifest(): AdminSessionManifest | null {
-  try {
-    return parseAdminSessionManifest(JSON.parse(readFileSync(getAdminSessionManifestPath(), 'utf8')));
   } catch {
-    return null;
+    // No legacy session is present.
   }
-}
 
-function removeAdminSessionManifest(): void {
   try {
-    rmSync(getAdminSessionManifestPath(), { force: true });
+    rmSync(manifestPath, { force: true });
   } catch {
     // The app may be quitting before Electron has a usable userData path.
   }
-}
 
-function writeAdminSessionManifest(session: AdminSessionState, expiresAt: number): void {
-  const manifest: AdminSessionManifest = {
-    version: 3,
-    deviceIndex: session.deviceIndex,
-    connectionId: session.connectionId,
-    rawKey: session.rawKey,
-    deviceIdentityKey: session.deviceIdentityKey,
-    usbSessionId: session.usbSessionId,
-    stageRoot: session.stageRoot,
-    stagedHelper: session.stagedHelper,
-    runnerPath: session.runnerPath,
-    inputPath: session.inputPath,
-    outputPath: session.outputPath,
-    pidPath: session.pidPath,
-    stopPath: session.stopPath,
-    expirePath: session.expirePath,
-    processPid: session.processPid ?? readPidFile(session.pidPath),
-    createdAt: Date.now(),
-    expiresAt
-  };
+  if (!manifest) {
+    return;
+  }
 
-  const manifestPath = getAdminSessionManifestPath();
-  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-  chmodSync(manifestPath, 0o600);
-}
-
-function stopDetachedAdminSession(manifest: AdminSessionManifest, reason: string): void {
   try {
-    writeFileSync(manifest.stopPath, `${new Date().toISOString()} ${reason}\n`, 'utf8');
-    appendLog(`requested detached admin mtp runner stop through stop file: ${reason}`);
+    writeFileSync(
+      manifest.stopPath,
+      `${new Date().toISOString()} This connection method is no longer used.\n`,
+      'utf8'
+    );
   } catch (error) {
-    appendLog(`unable to write detached admin mtp stop file: ${error instanceof Error ? error.message : String(error)}`);
+    appendLog(`unable to stop a legacy privileged MTP helper: ${
+      error instanceof Error ? error.message : String(error)
+    }`);
   }
 
   const pid = manifest.processPid ?? readPidFile(manifest.pidPath);
@@ -754,171 +977,12 @@ function stopDetachedAdminSession(manifest: AdminSessionManifest, reason: string
 
   try {
     process.kill(pid, 'SIGTERM');
-    appendLog(`sent SIGTERM to detached admin mtp runner ${pid}: ${reason}`);
   } catch (error) {
     const nodeError = error as NodeJS.ErrnoException;
-    if (nodeError.code !== 'EPERM') {
-      appendLog(`unable to signal detached admin mtp runner ${pid}: ${nodeError.message || String(error)}`);
+    if (nodeError.code !== 'EPERM' && nodeError.code !== 'ESRCH') {
+      appendLog(`unable to signal a legacy privileged MTP helper: ${nodeError.message || String(error)}`);
     }
   }
-}
-
-async function attachDetachedAdminMtpSession(deviceIndex: number, rawDevice: RawDevice): Promise<boolean> {
-  if (adminSession) {
-    return true;
-  }
-
-  const manifest = readAdminSessionManifest();
-  if (!manifest) {
-    return false;
-  }
-
-  const rawKey = rawDeviceKey(rawDevice);
-  const connectionId = rawDeviceConnectionId(rawDevice);
-  const identityKey = rawDeviceIdentityKey(rawDevice);
-  if (manifest.connectionId !== connectionId || usbSessionChanged(manifest.usbSessionId, rawDevice)) {
-    appendLog(
-      `discarding detached protected MTP session because phone attachment changed: ${manifest.connectionId} -> ${connectionId}`
-    );
-    stopDetachedAdminSession(manifest, 'Phone was unplugged and reconnected.');
-    removeAdminSessionManifest();
-    return false;
-  }
-
-  if (manifest.rawKey !== rawKey || manifest.deviceIndex !== deviceIndex) {
-    appendLog(
-      `reattaching protected MTP session for the same phone attachment across index/address change: ${manifest.deviceIndex}/${manifest.rawKey} -> ${deviceIndex}/${rawKey}`
-    );
-  }
-
-  if (Date.now() >= manifest.expiresAt) {
-    appendLog('discarding expired detached admin mtp session');
-    stopDetachedAdminSession(manifest, 'Detached protected session expired.');
-    removeAdminSessionManifest();
-    return false;
-  }
-
-  const processPid = manifest.processPid ?? readPidFile(manifest.pidPath);
-  if (
-    !existsSync(manifest.stageRoot) ||
-    !existsSync(manifest.inputPath) ||
-    !existsSync(manifest.outputPath) ||
-    !isProcessAlive(processPid)
-  ) {
-    appendLog('discarding detached admin mtp session because its runner is no longer available');
-    removeAdminSessionManifest();
-    return false;
-  }
-
-  let outputOffset = 0;
-  try {
-    outputOffset = statSync(manifest.outputPath).size;
-  } catch {
-    outputOffset = 0;
-  }
-
-  const session: AdminSessionState = {
-    deviceIndex,
-    connectionId,
-    rawKey,
-    deviceIdentityKey: identityKey,
-    usbSessionId: manifest.usbSessionId ?? rawDeviceUsbSessionId(rawDevice),
-    stageRoot: manifest.stageRoot,
-    stagedHelper: manifest.stagedHelper,
-    runnerPath: manifest.runnerPath,
-    inputPath: manifest.inputPath,
-    outputPath: manifest.outputPath,
-    pidPath: manifest.pidPath,
-    stopPath: manifest.stopPath,
-    expirePath: manifest.expirePath,
-    processPid,
-    input: null,
-    outputOffset,
-    outputBuffer: '',
-    stderrBuffer: '',
-    isReady: true,
-    ready: Promise.resolve(),
-    readyResolve: null,
-    readyReject: null,
-    readyTimer: null,
-    pollTimer: null,
-    activeCommand: null,
-    queue: []
-  };
-
-  try {
-    writeFileSync(session.expirePath, '', 'utf8');
-  } catch {
-    // The runner only uses this file as an idle-session deadline.
-  }
-
-  adminSession = session;
-  session.pollTimer = setInterval(() => pollAdminSessionOutput(session), 100);
-  session.input = createWriteStream(session.inputPath, { flags: 'w' });
-  session.input.on('error', (error) => {
-    if (adminSession === session) {
-      destroyAdminMtpSession(`Admin MTP input error after reconnect: ${error.message}`, true);
-    }
-  });
-  appendLog(`reattached protected MTP session without a new Mac password prompt for raw device ${rawKey}`);
-  return true;
-}
-
-async function reattachProtectedSessionFromRawDevices(rawDevices: RawDevice[]): Promise<boolean> {
-  if (adminSession) {
-    return true;
-  }
-
-  const rawMtpDevice = rawDevices.find((device) => device.connectionMode === 'mtp');
-  if (!rawMtpDevice) {
-    return false;
-  }
-
-  try {
-    return await attachDetachedAdminMtpSession(rawMtpDevice.index, rawMtpDevice);
-  } catch (error) {
-    appendLog(
-      `status protected MTP reattach failed: ${error instanceof Error ? error.message : String(error)}`
-    );
-    return false;
-  }
-}
-
-function stopAdminSessionProcess(session: AdminSessionState, reason: string): void {
-  try {
-    writeFileSync(session.stopPath, `${new Date().toISOString()} ${reason}\n`, 'utf8');
-    appendLog(`requested admin mtp runner stop through stop file: ${reason}`);
-  } catch (error) {
-    appendLog(`unable to write admin mtp stop file: ${error instanceof Error ? error.message : String(error)}`);
-  }
-
-  const pid = session.processPid ?? readPidFile(session.pidPath);
-  if (!pid) {
-    appendLog(`admin mtp session has no runner pid to stop: ${reason}`);
-    return;
-  }
-
-  try {
-    process.kill(pid, 'SIGTERM');
-    appendLog(`sent SIGTERM to admin mtp runner ${pid}: ${reason}`);
-    setTimeout(() => {
-      try {
-        process.kill(pid, 'SIGKILL');
-        appendLog(`sent SIGKILL to admin mtp runner ${pid}: ${reason}`);
-      } catch {
-        // The runner already exited.
-      }
-    }, 1200);
-    return;
-  } catch (error) {
-    const nodeError = error as NodeJS.ErrnoException;
-    if (nodeError.code !== 'EPERM') {
-      appendLog(`unable to signal admin mtp runner ${pid}: ${nodeError.message || String(error)}`);
-      return;
-    }
-  }
-
-  appendLog(`admin mtp runner ${pid} is root-owned; waiting for stop file handling: ${reason}`);
 }
 
 async function refreshRawDevices(): Promise<RawDevice[]> {
@@ -951,6 +1015,7 @@ async function refreshRawDevices(): Promise<RawDevice[]> {
   }
 
   lastRawDevices = status.rawDevices;
+  rememberRawDeviceConnections(lastRawDevices);
   return lastRawDevices;
 }
 
@@ -960,20 +1025,20 @@ function getRawKeyForDeviceIndex(deviceIndex: number): string | null {
 }
 
 function blockedMtpAccessMessage(): string {
-  const serviceHint = macCameraServiceHint();
-  return [
-    'Phone is visible in File Transfer mode, but its folders are not open yet.',
-    'Use Open files to start one protected phone-file session.',
-    serviceHint
-  ]
-    .filter(Boolean)
-    .join(' ');
+  return 'Another Mac app is using the phone USB connection. Close Photos, Image Capture, and other Android transfer apps, then try again.';
 }
 
 function sessionErrorMessage(base: string, error: unknown, stderr: string): string {
   const rawMessage = error instanceof Error ? error.message : String(error);
-  if (normalMtpAccessBlocked(error, stderr)) {
+  const issue = classifyMtpConnectionIssue(error, stderr);
+  if (issue === 'phone-not-responding') {
+    return 'The phone did not answer the file request yet. Keep it unlocked and in File transfer while the app tries again.';
+  }
+  if (issue === 'other-app-owns-usb') {
     return blockedMtpAccessMessage();
+  }
+  if (issue === 'cancelled') {
+    return 'Opening phone files was canceled.';
   }
 
   const hint = bridgeFailureHint(stderr, rawMessage.toLowerCase().includes('timed out'));
@@ -988,13 +1053,11 @@ function normalMtpAccessBlocked(error: unknown, stderr: string): boolean {
   const rawMessage = error instanceof Error ? error.message : String(error);
   const combined = `${rawMessage}\n${stderr}`.toLowerCase();
   return (
-    combined.includes('usb connection is stuck') ||
     combined.includes('libusb_claim_interface') ||
     combined.includes('libusb_error_access') ||
     combined.includes('access denied') ||
-    combined.includes('ptp_error_io') ||
-    combined.includes('failed to open session') ||
-    combined.includes('unable to initialize device')
+    combined.includes('libusb_error_busy') ||
+    combined.includes('another process has device opened for exclusive access')
   );
 }
 
@@ -1034,27 +1097,22 @@ function cancelFolderListing(): boolean {
     stopped = true;
   }
 
-  if (adminSession) {
-    const queuedProtected = rejectQueuedCommands(adminSession.queue);
-    if (queuedProtected > 0) {
-      appendLog(`user stopped ${queuedProtected} queued protected MTP folder listing command(s)`);
-      stopped = true;
-    }
-  }
-
   if (canCancelCommand(activeSessionCommand)) {
     appendLog(`user stopped active MTP ${activeSessionCommand?.name} command`);
     destroyMtpSession(cancelError.message, true);
     stopped = true;
   }
 
-  if (adminSession && canCancelCommand(adminSession.activeCommand)) {
-    appendLog(`user stopped active protected MTP ${adminSession.activeCommand?.name} command`);
-    destroyAdminMtpSession(cancelError.message, true);
-    stopped = true;
-  }
-
   return stopped;
+}
+
+function cancelConnectionAttempt(): boolean {
+  if (!sessionProcess || sessionConnectionId) {
+    return cancelFolderListing();
+  }
+  appendLog('user canceled the active MTP connection attempt');
+  void destroyMtpSession('Opening phone files was canceled.', true);
+  return true;
 }
 
 function rejectSessionCommands(error: Error): void {
@@ -1087,6 +1145,20 @@ function clearSessionReady(error?: Error): void {
   sessionReadyReject = null;
 }
 
+function armSessionOpenWatchdog(child: ChildProcessWithoutNullStreams): void {
+  if (sessionReadyTimer) {
+    clearTimeout(sessionReadyTimer);
+  }
+  sessionReadyTimer = setTimeout(() => {
+    if (sessionProcess === child && !sessionConnectionId) {
+      void destroyMtpSession(
+        `MTP session stopped responding for ${MTP_CONNECTION_WATCHDOG_MS}ms while opening.`,
+        true
+      );
+    }
+  }, MTP_CONNECTION_WATCHDOG_MS);
+}
+
 function clearCommandTimer(command: SessionCommand): void {
   if (command.timer) {
     clearTimeout(command.timer);
@@ -1109,30 +1181,56 @@ function waitForChildProcessExit(
 
   return new Promise((resolvePromise) => {
     let settled = false;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
     const finish = (): void => {
       if (settled) {
         return;
       }
       settled = true;
-      clearTimeout(timeout);
+      if (timeout) {
+        clearTimeout(timeout);
+      }
       child.off('close', finish);
-      child.off('error', finish);
+      child.off('exit', finish);
+      child.off('error', handleError);
       resolvePromise();
     };
-    const timeout = setTimeout(() => {
+    const handleError = (): void => {
+      if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) {
+        finish();
+      }
+    };
+    timeout = setTimeout(() => {
       if (child.exitCode === null && child.signalCode === null) {
         child.kill('SIGKILL');
+        appendLog(
+          `MTP helper PID ${child.pid ?? 'unknown'} did not report its exit within ${timeoutMs}ms; released the connection-attempt barrier.`
+        );
       }
-      setTimeout(finish, 250);
+      finish();
     }, timeoutMs);
     child.once('close', finish);
-    child.once('error', finish);
+    child.once('exit', finish);
+    child.once('error', handleError);
+
+    if (child.exitCode !== null || child.signalCode !== null) {
+      finish();
+    }
   });
 }
 
-function destroyMtpSession(reason: string, forceProcessStop = false): void {
+function destroyMtpSession(
+  reason: string,
+  forceProcessStop = false,
+  requestGracefulQuit = true
+): Promise<void> {
   appendLog(`mtp session closing: ${reason}`);
   const processToClose = sessionProcess;
+  const teardown = processToClose
+    ? trackMtpSessionTeardown(
+        waitForChildProcessExit(processToClose, MTP_SESSION_EXIT_KILL_AFTER_MS)
+      )
+    : Promise.resolve();
   const error = new Error(reason);
 
   lastSessionStderr = sessionStderrBuffer.trim() || lastSessionStderr;
@@ -1145,15 +1243,20 @@ function destroyMtpSession(reason: string, forceProcessStop = false): void {
   pendingSessionRawKey = null;
   sessionConnectionId = null;
   pendingSessionConnectionId = null;
-  if (!adminSession) {
-    rawDevicesMissingSince = null;
-  }
+  sessionDeviceIdentityKey = null;
+  pendingSessionDeviceIdentityKey = null;
+  rawDevicesMissingSince = null;
+  openingDeviceMissingSince = null;
   sessionStdoutBuffer = '';
   sessionStderrBuffer = '';
 
   if (processToClose && processToClose.exitCode === null && processToClose.signalCode === null) {
     try {
-      if (!processToClose.stdin.destroyed && processToClose.stdin.writable) {
+      if (
+        requestGracefulQuit &&
+        !processToClose.stdin.destroyed &&
+        processToClose.stdin.writable
+      ) {
         processToClose.stdin.end('quit\n');
         appendLog(`sent graceful quit to MTP session: ${reason}`);
       }
@@ -1176,6 +1279,8 @@ function destroyMtpSession(reason: string, forceProcessStop = false): void {
       }, 1500);
     }
   }
+
+  return teardown;
 }
 
 function finishActiveSessionCommand(payload: SessionPayload): void {
@@ -1217,8 +1322,10 @@ function handleSessionPayload(payload: SessionPayload): void {
           productId: payload.productId
         });
         sessionConnectionId = pendingSessionConnectionId;
+        sessionDeviceIdentityKey = pendingSessionDeviceIdentityKey;
         pendingSessionRawKey = null;
         pendingSessionConnectionId = null;
+        pendingSessionDeviceIdentityKey = null;
       }
       if (sessionReadyTimer) {
         clearTimeout(sessionReadyTimer);
@@ -1227,10 +1334,15 @@ function handleSessionPayload(payload: SessionPayload): void {
       sessionReadyResolve?.();
       sessionReadyResolve = null;
       sessionReadyReject = null;
+      clearMacCameraClient('the phone answered and the MTP session opened');
+      mainWindow?.webContents.send('mtp:connection-phase', {
+        phase: 'listing-storage',
+        connectionId: sessionConnectionId ?? undefined
+      } satisfies MtpConnectionPhaseEvent);
       appendLog(payload.message || 'mtp session opened');
     } else {
       const message = payload.message || 'Unable to open the MTP session.';
-      destroyMtpSession(message);
+      void destroyMtpSession(message, true, false);
     }
     return;
   }
@@ -1302,6 +1414,7 @@ function pumpSessionQueue(): void {
 }
 
 async function ensureMtpSession(deviceIndex: number, expectedConnectionId?: string): Promise<void> {
+  await waitForMtpSessionTeardown();
   const helperPath = await ensureBridge();
 
   if (lastRawDevices.length === 0) {
@@ -1316,47 +1429,71 @@ async function ensureMtpSession(deviceIndex: number, expectedConnectionId?: stri
     throw new Error('The selected phone connection changed or is no longer available.');
   }
   const connectionId = rawDeviceConnectionId(rawDevice);
-  const rawKey = rawDeviceKey(rawDevice);
+  let deviceIdentityKey = rawDeviceIdentityKey(rawDevice);
+  let rawKey = rawDeviceKey(rawDevice);
   deviceIndex = rawDevice.index;
 
-  if (
-    sessionProcess &&
-    sessionConnectionId === connectionId &&
-    sessionReady
-  ) {
+  if (openSessionServesConnection(connectionId, deviceIdentityKey)) {
     sessionDeviceIndex = deviceIndex;
     await sessionReady;
     return;
   }
 
+  await waitForUsbConnectionToSettle(connectionId);
+  await refreshRawDevices();
+  rawDevice = rawDeviceForConnection(deviceIndex, connectionId);
+  if (!rawDevice) {
+    throw new Error('The phone re-established its USB connection while MTP was preparing to open.');
+  }
+  deviceIndex = rawDevice.index;
+  deviceIdentityKey = rawDeviceIdentityKey(rawDevice);
+  rawKey = rawDeviceKey(rawDevice);
+
   if (sessionProcess) {
-    const previousSession = sessionProcess;
-    destroyMtpSession('Restarting MTP session for a different phone connection.', true);
-    await waitForChildProcessExit(previousSession, 4000);
+    await destroyMtpSession('Restarting MTP session for a different phone connection.', true);
+  }
+
+  if (!(await releaseMacMtpCameraOwnerAndWait(rawDevice))) {
+    appendLog(
+      `macOS camera import still owns the MTP interface for ${connectionId}; the bounded connection attempt stopped without resetting the phone USB session`
+    );
+    throw new Error(blockedMtpAccessMessage());
   }
 
   sessionStdoutBuffer = '';
   sessionStderrBuffer = '';
-  const child = spawn(helperPath, ['session', String(deviceIndex)]);
+  lastSessionStderr = '';
+  const child = spawn(helperPath, ['session', String(deviceIndex)], {
+    env: {
+      ...process.env,
+      MAC_ANDROID_TRANSFER_DISABLE_USB_RESET: '1',
+      ...(MTP_DIAGNOSTIC_DEBUG ? { LIBMTP_DEBUG: '13' } : {})
+    }
+  });
   sessionProcess = child;
   sessionDeviceIndex = deviceIndex;
   sessionRawKey = null;
   pendingSessionRawKey = rawKey;
   sessionConnectionId = null;
   pendingSessionConnectionId = connectionId;
+  sessionDeviceIdentityKey = null;
+  pendingSessionDeviceIdentityKey = deviceIdentityKey;
+  mainWindow?.webContents.send('mtp:connection-phase', {
+    phase: 'opening',
+    connectionId
+  } satisfies MtpConnectionPhaseEvent);
   appendLog(`mtp session starting for device index ${deviceIndex}`);
 
   sessionReady = new Promise<void>((resolve, reject) => {
     sessionReadyResolve = resolve;
     sessionReadyReject = reject;
-    sessionReadyTimer = setTimeout(() => {
-      destroyMtpSession(`MTP session open timed out after ${NORMAL_MTP_SESSION_OPEN_TIMEOUT_MS}ms.`, true);
-    }, NORMAL_MTP_SESSION_OPEN_TIMEOUT_MS);
   });
+  armSessionOpenWatchdog(child);
 
   child.stdout.on('data', handleSessionStdout);
   child.stderr.on('data', (chunk: Buffer) => {
-    sessionStderrBuffer += chunk.toString('utf8');
+    const stderrChunk = chunk.toString('utf8');
+    sessionStderrBuffer += stderrChunk;
     if (sessionStderrBuffer.length > 20_000) {
       sessionStderrBuffer = sessionStderrBuffer.slice(-20_000);
     }
@@ -1371,6 +1508,9 @@ async function ensureMtpSession(deviceIndex: number, expectedConnectionId?: stri
     const message = `MTP session exited with code ${code ?? 'null'} signal ${signal ?? 'null'}.`;
     appendLog(message);
     if (sessionProcess === child) {
+      if (MTP_DIAGNOSTIC_DEBUG && sessionStderrBuffer.trim()) {
+        appendLog(`MTP session debug output:\n${sessionStderrBuffer.trim()}`);
+      }
       lastSessionStderr = sessionStderrBuffer.trim() || lastSessionStderr;
       clearSessionReady(new Error(message));
       rejectSessionCommands(new Error(message));
@@ -1380,6 +1520,8 @@ async function ensureMtpSession(deviceIndex: number, expectedConnectionId?: stri
       pendingSessionRawKey = null;
       sessionConnectionId = null;
       pendingSessionConnectionId = null;
+      sessionDeviceIdentityKey = null;
+      pendingSessionDeviceIdentityKey = null;
       sessionStdoutBuffer = '';
       sessionStderrBuffer = '';
     }
@@ -1433,7 +1575,13 @@ async function runBridgeJson<T>(
       const child = execFile(
         helperPath,
         [command, ...args],
-        { maxBuffer: 1024 * 1024 * 100 },
+        {
+          maxBuffer: 1024 * 1024 * 100,
+          env: {
+            ...process.env,
+            MAC_ANDROID_TRANSFER_DISABLE_USB_RESET: '1'
+          }
+        },
         (error, stdout, stderr) => {
           if (settled) {
             return;
@@ -1533,34 +1681,13 @@ async function getStatus(): Promise<DeviceStatus> {
   }
 
   lastRawDevices = status.rawDevices;
-  const protectedSessionReattached = await reattachProtectedSessionFromRawDevices(lastRawDevices);
-  if (protectedSessionReattached && status.state !== 'connected') {
-    status = {
-      ...status,
-      ok: true,
-      state: 'connected',
-      message: 'Protected phone-file session is still open. Reconnecting without another Mac password prompt.',
-      deviceCount: Math.max(status.deviceCount, lastRawDevices.length),
-      rawDevices: lastRawDevices
-    };
-  }
+  rememberRawDeviceConnections(lastRawDevices);
 
   const currentKeys = new Set(lastRawDevices.map((device) => rawDeviceKey(device)));
   const currentConnectionIds = new Set(lastRawDevices.map(rawDeviceConnectionId));
+  const currentDeviceIdentityKeys = new Set(lastRawDevices.map(rawDeviceIdentityKey));
   if (currentKeys.size > 0) {
     rawDevicesMissingSince = null;
-  }
-
-  if (adminSession && currentKeys.size > 0) {
-    const visibleAdminDevice = findVisibleDeviceForAdminSession(adminSession, lastRawDevices);
-    if (!visibleAdminDevice) {
-      destroyAdminMtpSession('The protected session belongs to a different phone connection.', true);
-    } else if (usbSessionChanged(adminSession.usbSessionId, visibleAdminDevice)) {
-      appendLog(
-        `discarding protected MTP session because USB session changed: ${adminSession.usbSessionId} -> ${visibleAdminDevice.usbSessionId}`
-      );
-      destroyAdminMtpSession('Phone was unplugged and reconnected. Open files again for this USB session.', true);
-    }
   }
 
   if (
@@ -1569,50 +1696,84 @@ async function getStatus(): Promise<DeviceStatus> {
     currentConnectionIds.size > 0 &&
     !currentConnectionIds.has(sessionConnectionId)
   ) {
-    destroyMtpSession('The open MTP session belongs to a different phone connection.', true);
+    const samePhoneStillVisible =
+      !!sessionDeviceIdentityKey && currentDeviceIdentityKeys.has(sessionDeviceIdentityKey);
+    if (!samePhoneStillVisible) {
+      destroyMtpSession('The open MTP session belongs to a different phone connection.', true);
+    } else if (connectionIdIsUsbSessionScoped(sessionConnectionId)) {
+      appendLog(
+        `phone re-enumerated on USB (${sessionConnectionId} -> ${Array.from(currentConnectionIds).join(',')}); reopening the MTP session on the new connection`
+      );
+      destroyMtpSession('The phone re-established its USB connection.', true);
+    }
   }
 
-  if (sessionProcess || adminSession) {
-    if (currentKeys.size === 0) {
-      if (adminSession && !sessionProcess) {
-        if (rawDevicesMissingSince === null) {
-          rawDevicesMissingSince = Date.now();
-          appendLog('raw MTP device not visible to status while protected session is open; keeping protected session alive until the helper exits');
-        }
-      } else {
-        const now = Date.now();
-        if (rawDevicesMissingSince === null) {
-          rawDevicesMissingSince = now;
-          appendLog('raw MTP device temporarily missing while a normal session is open; keeping the session alive');
-        }
+  if (sessionProcess && !sessionConnectionId && pendingSessionConnectionId) {
+    const pendingConnectionStillVisible = lastRawDevices.some(
+      (device) =>
+        rawDeviceConnectionId(device) === pendingSessionConnectionId &&
+        device.connectionMode === 'mtp'
+    );
+    const sameMtpIdentityMoved =
+      !!pendingSessionDeviceIdentityKey &&
+      currentDeviceIdentityKeys.has(pendingSessionDeviceIdentityKey) &&
+      !currentConnectionIds.has(pendingSessionConnectionId);
 
-        if (now - rawDevicesMissingSince >= RAW_DEVICE_MISSING_SESSION_GRACE_MS && sessionProcess) {
-          destroyMtpSession('MTP raw device disappeared.');
-        }
+    if (pendingConnectionStillVisible) {
+      openingDeviceMissingSince = null;
+    } else if (sameMtpIdentityMoved) {
+      appendLog(
+        `phone changed USB connection while MTP was opening (${pendingSessionConnectionId} -> ${Array.from(currentConnectionIds).join(',')}); abandoning the stale attempt`
+      );
+      destroyMtpSession('The phone re-established its USB connection while opening files.', true);
+    } else {
+      const now = Date.now();
+      if (openingDeviceMissingSince === null) {
+        openingDeviceMissingSince = now;
+        appendLog('File Transfer disappeared while MTP was opening; waiting for one confirming status check');
+      } else if (now - openingDeviceMissingSince >= OPENING_DEVICE_MISSING_GRACE_MS) {
+        destroyMtpSession('File Transfer was turned off while opening phone files.', true);
+      }
+    }
+  } else {
+    openingDeviceMissingSince = null;
+  }
+
+  if (sessionProcess) {
+    if (currentKeys.size === 0) {
+      const now = Date.now();
+      if (rawDevicesMissingSince === null) {
+        rawDevicesMissingSince = now;
+        appendLog('raw MTP device temporarily missing while the persistent session is open; keeping the session alive');
+      }
+
+      if (now - rawDevicesMissingSince >= RAW_DEVICE_MISSING_SESSION_GRACE_MS) {
+        destroyMtpSession('MTP raw device disappeared.', true);
       }
     } else {
       if (sessionProcess && sessionRawKey && !currentKeys.has(sessionRawKey)) {
         appendLog(`preserving open MTP session for the same USB attachment across raw address change: ${sessionRawKey} -> ${Array.from(currentKeys).join(',')}`);
       }
-      if (adminSession && !currentKeys.has(adminSession.rawKey)) {
-        appendLog(`preserving protected MTP session across raw USB re-enumeration: ${adminSession.rawKey} -> ${Array.from(currentKeys).join(',')}`);
-      }
     }
   }
 
+  const normalSessionOpen = !!sessionProcess && !!sessionConnectionId && !!sessionDeviceIdentityKey;
+  const hasMtpDevice = lastRawDevices.some((device) => device.connectionMode === 'mtp');
+  const connectionPhase: MtpConnectionPhase = !lastRawDevices.length
+    ? 'no-phone'
+    : !hasMtpDevice
+      ? 'file-transfer-off'
+      : normalSessionOpen
+        ? 'listing-storage'
+        : 'opening';
+
   return {
     ...status,
-    sessionOpen: !!sessionProcess || !!adminSession,
-    protectedSessionOpen: !!adminSession,
-    sessionConnectionId:
-      adminSession?.connectionId ?? sessionConnectionId ?? pendingSessionConnectionId ?? undefined,
-    sessionConnectionIds: Array.from(
-      new Set(
-        [adminSession?.connectionId, sessionConnectionId, pendingSessionConnectionId].filter(
-          (connectionId): connectionId is string => !!connectionId
-        )
-      )
-    )
+    connectionPhase,
+    sessionOpen: normalSessionOpen,
+    sessionConnectionId: sessionConnectionId ?? undefined,
+    sessionConnectionIds: sessionConnectionId ? [sessionConnectionId] : [],
+    usbOwnerApp: normalSessionOpen ? undefined : currentMacCameraClientApp()
   };
 }
 
@@ -1677,9 +1838,6 @@ function connectionDiagnosis(status: DeviceStatus): string {
   const rawMtpVisible = status.rawDevices.some((device) => device.connectionMode === 'mtp');
   const rawUsbVisible = status.rawDevices.length > 0;
 
-  if (status.protectedSessionOpen) {
-    return 'Protected MTP file session is open.';
-  }
   if (status.sessionOpen || status.state === 'connected') {
     return 'MTP file session is open.';
   }
@@ -1697,7 +1855,7 @@ function buildDiagnosticsReport(status: DeviceStatus, generatedAt: string): stri
   const rawDevices = status.rawDevices.length
     ? status.rawDevices.map(rawDeviceLine)
     : ['- none reported'];
-  const stderr = limitDiagnosticText(status.stderr || lastSessionStderr || adminSession?.stderrBuffer);
+  const stderr = limitDiagnosticText(status.stderr || lastSessionStderr);
 
   return [
     'Android File Transfer for macOS Diagnostics',
@@ -1705,7 +1863,7 @@ function buildDiagnosticsReport(status: DeviceStatus, generatedAt: string): stri
     '',
     'App',
     `Version: ${app.getVersion()}`,
-    `Packaged: ${app.isPackaged ? 'yes' : 'no'}`,
+    `Packaged: ${app.isPackaged && !IS_DEVELOPMENT_RUNTIME ? 'yes' : 'no'}`,
     `Platform: ${process.platform} ${process.arch}`,
     `Electron: ${process.versions.electron ?? 'unknown'}`,
     `Node: ${process.versions.node}`,
@@ -1721,7 +1879,7 @@ function buildDiagnosticsReport(status: DeviceStatus, generatedAt: string): stri
     `Message: ${status.message}`,
     `Device count: ${status.deviceCount}`,
     `Session open: ${status.sessionOpen ? 'yes' : 'no'}`,
-    `Protected session open: ${status.protectedSessionOpen ? 'yes' : 'no'}`,
+    `Connection phase: ${status.connectionPhase ?? 'unknown'}`,
     `Camera/import services: ${cameraServices.length ? cameraServices.join(', ') : 'none detected'}`,
     '',
     'Raw USB devices',
@@ -1778,12 +1936,191 @@ async function copyDiagnostics(): Promise<DiagnosticsCopyResult> {
   }
 }
 
+async function readBoundedResponseText(response: Response): Promise<string> {
+  const declaredLength = Number(response.headers.get('content-length'));
+  if (Number.isFinite(declaredLength) && declaredLength > UPDATE_RESPONSE_MAX_BYTES) {
+    throw new Error('GitHub returned an unexpectedly large update response.');
+  }
+  if (!response.body) {
+    return '';
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let total = 0;
+  let text = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    total += value.byteLength;
+    if (total > UPDATE_RESPONSE_MAX_BYTES) {
+      await reader.cancel();
+      throw new Error('GitHub returned an unexpectedly large update response.');
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+  return text + decoder.decode();
+}
+
+async function fetchAppUpdateResult(): Promise<AppUpdateCheckResult> {
+  const checkedAt = new Date().toISOString();
+  const currentVersion = app.getVersion();
+  if (!net.isOnline()) {
+    return {
+      ok: false,
+      status: 'error',
+      currentVersion,
+      checkedAt,
+      message: 'The Mac appears to be offline. Connect to the internet and try again.'
+    };
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), UPDATE_CHECK_TIMEOUT_MS);
+  try {
+    const response = await net.fetch(GITHUB_RELEASES_API, {
+      cache: 'no-store',
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': `Android-File-Transfer-for-macOS/${currentVersion}`,
+        'X-GitHub-Api-Version': '2022-11-28'
+      },
+      signal: controller.signal
+    });
+    if (!response.ok) {
+      throw new Error(`GitHub release service returned HTTP ${response.status}.`);
+    }
+    const body = await readBoundedResponseText(response);
+    const parsed = JSON.parse(body) as unknown;
+    if (!Array.isArray(parsed)) {
+      throw new Error('GitHub returned an invalid release list.');
+    }
+    const selected = selectLatestRelease(currentVersion, parsed as ReleaseCandidate[]);
+    if (!selected) {
+      appendLog(`update check complete: ${currentVersion} is current`);
+      return {
+        ok: true,
+        status: 'up-to-date',
+        currentVersion,
+        checkedAt,
+        message: `Version ${currentVersion} is up to date.`
+      };
+    }
+    appendLog(`update available: ${currentVersion} -> ${selected.version}`);
+    return {
+      ok: true,
+      status: 'update-available',
+      currentVersion,
+      latestVersion: selected.version,
+      releaseTag: selected.tag,
+      checkedAt,
+      message: `Version ${selected.version} is available.`
+    };
+  } catch (error) {
+    const aborted = controller.signal.aborted;
+    appendLog(`update check failed: ${error instanceof Error ? error.message : String(error)}`);
+    return {
+      ok: false,
+      status: 'error',
+      currentVersion,
+      checkedAt,
+      message: aborted
+        ? 'The update check took too long. Try again.'
+        : 'Could not reach the GitHub release service. Try again later.'
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function getAppUpdateResult(): Promise<AppUpdateCheckResult> {
+  if (updateCheckInFlight) {
+    return updateCheckInFlight;
+  }
+  updateCheckInFlight = fetchAppUpdateResult().finally(() => {
+    updateCheckInFlight = null;
+  });
+  return updateCheckInFlight;
+}
+
+async function showUpdateCheckDialog(result: AppUpdateCheckResult): Promise<void> {
+  let options: MessageBoxOptions;
+  if (result.status === 'update-available' && result.latestVersion && result.releaseTag) {
+    options = {
+      type: 'info',
+      title: 'Update Available',
+      message: `Version ${result.latestVersion} is available.`,
+      detail: `You are using version ${result.currentVersion}. GitHub will show the signed downloads and release notes.`,
+      buttons: ['View Release', 'Later'],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true
+    };
+  } else if (result.status === 'up-to-date') {
+    options = {
+      type: 'info',
+      title: 'No Updates',
+      message: 'Android File Transfer for macOS is up to date.',
+      detail: `You are using version ${result.currentVersion}.`,
+      buttons: ['OK'],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true
+    };
+  } else {
+    options = {
+      type: 'warning',
+      title: 'Update Check Failed',
+      message: 'Could not check for updates.',
+      detail: result.message,
+      buttons: ['OK'],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true
+    };
+  }
+
+  const response = mainWindow && !mainWindow.isDestroyed()
+    ? await dialog.showMessageBox(mainWindow, options)
+    : await dialog.showMessageBox(options);
+  if (response.response === 0 && result.status === 'update-available' && result.releaseTag) {
+    await openUpdateRelease(result.releaseTag);
+  }
+}
+
+async function checkForAppUpdates(interactive: boolean): Promise<AppUpdateCheckResult> {
+  const result = await getAppUpdateResult();
+  if (interactive) {
+    await showUpdateCheckDialog(result);
+  }
+  return result;
+}
+
+async function openUpdateRelease(releaseTag: string): Promise<OpenUpdateReleaseResult> {
+  const normalized = typeof releaseTag === 'string' ? normalizeSemanticVersion(releaseTag) : null;
+  if (!normalized) {
+    appendLog('blocked invalid update release tag');
+    return { ok: false, message: 'That update link is not valid.' };
+  }
+  try {
+    await shell.openExternal(`${GITHUB_RELEASES_WEB}${encodeURIComponent(releaseTag.trim())}`);
+    return { ok: true, message: `Opened the version ${normalized} release.` };
+  } catch (error) {
+    appendLog(`unable to open update release: ${error instanceof Error ? error.message : String(error)}`);
+    return { ok: false, message: 'Could not open the update page.' };
+  }
+}
+
 async function scanInventory(): Promise<InventoryResult> {
   const fallback: InventoryResult = {
     ok: false,
     state: 'error',
     message: 'Unable to scan the MTP device.',
     devices: [],
+    connectionPhase: 'needs-mode-reset',
+    connectionIssue: 'unknown',
     helperPath: getBridgePath(),
     logPath: getLogPath()
   };
@@ -1794,6 +2131,8 @@ async function scanInventory(): Promise<InventoryResult> {
     return helperMetadata({
       ...fallback,
       state: lastRawDevices.length ? 'connect-error' : 'no-device',
+      connectionPhase: lastRawDevices.length ? 'file-transfer-off' : 'no-phone',
+      connectionIssue: lastRawDevices.length ? undefined : 'disconnected',
       message: lastRawDevices.length
         ? 'A phone is connected, but File Transfer mode is not available.'
         : 'No phone file-transfer connection was detected.'
@@ -1803,47 +2142,106 @@ async function scanInventory(): Promise<InventoryResult> {
   const devices: MtpDeviceInventory[] = [];
   const failures: string[] = [];
   const stderrParts: string[] = [];
-  let usedProtectedAccess = false;
+  let fileAccessUnavailable = false;
+  let connectionIssue: MtpConnectionIssue = 'unknown';
 
   for (const rawDevice of candidates) {
     const connectionId = rawDeviceConnectionId(rawDevice);
     try {
-      const useProtectedAccess = await adminFallbackIsAvailable(rawDevice.index, connectionId);
-      const result = useProtectedAccess
-        ? await runAdminSessionCommand<InventoryResult & SessionPayload>(
-            rawDevice.index,
-            connectionId,
-            'inventory',
-            [],
-            60_000
-          )
-        : await runSessionCommand<InventoryResult & SessionPayload>(
-            rawDevice.index,
-            connectionId,
-            'inventory',
-            [],
-            60_000
-          );
+      const result = await runSessionCommand<InventoryResult & SessionPayload>(
+        rawDevice.index,
+        connectionId,
+        'inventory',
+        [],
+        60_000
+      );
       const nativeDevice =
         result.devices?.find((candidate) => candidate.index === rawDevice.index) ?? result.devices?.[0];
+      appendThrottledLog(
+        `inventory answer for ${connectionId}: ok=${String(result.ok)} devices=${result.devices?.length ?? 0} storages=${JSON.stringify(
+          nativeDevice?.storages?.map((storage) => ({ id: storage.id, inferred: storage.inferred === true })) ?? []
+        )}${result.ok ? '' : ` message=${result.message ?? ''}`}`
+      );
       if (!result.ok || !nativeDevice) {
+        connectionIssue = 'storage-unavailable';
         failures.push(result.message || `${rawDevice.vendor || rawDevice.product} did not return storage information.`);
+        continue;
+      }
+
+      const inferredStorages = nativeDevice.storages.filter((storage) => storage.inferred);
+      let inferredStorageIsReadable = true;
+      for (const storage of inferredStorages) {
+        try {
+          const reportProgress = (payload: SessionPayload): void => {
+            if (
+              payload.event !== 'progress' ||
+              typeof payload.sent !== 'number' ||
+              typeof payload.total !== 'number'
+            ) {
+              return;
+            }
+            mainWindow?.webContents.send('folder-list:progress', {
+              deviceConnectionId: connectionId,
+              storageId: storage.id,
+              parentId: MTP_ROOT_PARENT_ID,
+              sent: payload.sent,
+              total: payload.total
+            } satisfies FolderListProgress);
+          };
+          const rootResult = await runSessionCommand<FolderListResult & SessionPayload>(
+            rawDevice.index,
+            connectionId,
+            'list',
+            [String(storage.id), String(MTP_ROOT_PARENT_ID)],
+            180_000,
+            reportProgress
+          );
+          inferredStorageIsReadable = rootResult.ok === true;
+        } catch (error) {
+          inferredStorageIsReadable = false;
+          appendLog(
+            `inferred storage validation failed for ${connectionId}: ${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+
+        if (!inferredStorageIsReadable) {
+          break;
+        }
+      }
+
+      if (!inferredStorageIsReadable) {
+        fileAccessUnavailable = true;
+        connectionIssue = 'storage-unavailable';
+        failures.push(PHONE_FILES_UNAVAILABLE_MESSAGE);
+        appendThrottledLog(
+          `phone file access validation failed for ${connectionId}; keeping the persistent session open for an explicit storage retry (helper stderr: ${limitDiagnosticText(lastSessionStderr, 400) || 'none'})`
+        );
         continue;
       }
 
       devices.push({
         ...nativeDevice,
         index: rawDevice.index,
-        connectionId,
-        protectedAccess: useProtectedAccess
+        connectionId
       });
-      usedProtectedAccess = usedProtectedAccess || useProtectedAccess;
-      const stderr = useProtectedAccess ? adminSession?.stderrBuffer : lastSessionStderr;
+      const stderr = lastSessionStderr;
       if (stderr?.trim()) {
         stderrParts.push(stderr.trim());
       }
     } catch (error) {
-      const stderr = adminSession?.connectionId === connectionId ? adminSession.stderrBuffer : lastSessionStderr;
+      const stderr = lastSessionStderr;
+      connectionIssue = classifyMtpConnectionIssue(error, stderr);
+      // A claim refusal, or a phone that stops answering right after macOS
+      // camera import was released, both point at a Mac app that keeps
+      // reconnecting through ptpcamerad. Find out which one.
+      if (
+        connectionIssue === 'other-app-owns-usb' ||
+        (connectionIssue === 'phone-not-responding' &&
+          !!lastReleasedCameraOwner &&
+          Date.now() - lastReleasedCameraOwner.at < MAC_CAMERA_RELAUNCH_WINDOW_MS)
+      ) {
+        void detectMacCameraClient(`inventory failed with ${connectionIssue}`);
+      }
       const message = sessionErrorMessage(
         `Unable to open ${rawDevice.vendor || rawDevice.product || 'the phone'}.`,
         error,
@@ -1862,26 +2260,47 @@ async function scanInventory(): Promise<InventoryResult> {
       {
         ok: true,
         state: 'connected',
+        connectionPhase: 'ready',
+        connectionIssue: undefined,
         message: failures.length
           ? `Opened ${devices.length} phone${devices.length === 1 ? '' : 's'}; ${failures.length} other connection${failures.length === 1 ? '' : 's'} could not be opened.`
           : `Opened ${devices.length} phone${devices.length === 1 ? '' : 's'}.`,
         devices,
         helperPath: getBridgePath(),
-        logPath: getLogPath(),
-        protectedAccess: usedProtectedAccess
+        logPath: getLogPath()
       },
       stderrParts.join('\n')
     );
   }
 
   const combinedMessage = failures.join(' ').trim();
-  const accessBlocked = candidates.some((device) => device.needsDeviceAccessEntitlement) ||
-    normalMtpAccessBlocked(combinedMessage, stderrParts.join('\n'));
+  if (fileAccessUnavailable) {
+    return helperMetadata(
+      {
+        ...fallback,
+        state: 'connect-error',
+        connectionPhase: 'needs-mode-reset',
+        connectionIssue: 'storage-unavailable',
+        message: PHONE_FILES_UNAVAILABLE_MESSAGE,
+        fileAccessUnavailable: true
+      },
+      stderrParts.join('\n')
+    );
+  }
+  const finalIssue = connectionIssue === 'unknown'
+    ? classifyMtpConnectionIssue(combinedMessage, stderrParts.join('\n'))
+    : connectionIssue;
+  const usbOwnerApp = currentMacCameraClientApp();
   return helperMetadata(
     {
       ...fallback,
-      state: accessBlocked ? 'connect-error' : 'error',
-      message: accessBlocked ? blockedMtpAccessMessage() : combinedMessage || fallback.message
+      state: 'connect-error',
+      connectionPhase: connectionPhaseForIssue(finalIssue),
+      connectionIssue: finalIssue,
+      message: usbOwnerApp
+        ? `${usbOwnerApp} is using the phone through macOS Image Capture. Quit ${usbOwnerApp}; the app will connect on its own.`
+        : sessionErrorMessage(fallback.message, combinedMessage || fallback.message, stderrParts.join('\n')),
+      usbOwnerApp
     },
     stderrParts.join('\n')
   );
@@ -1918,33 +2337,11 @@ async function listFolder(
     storageId,
     parentId,
     objects: [],
+    connectionPhase: 'needs-mode-reset',
+    connectionIssue: 'unknown',
     helperPath: getBridgePath(),
     logPath: getLogPath()
   };
-
-  if (await adminFallbackIsAvailable(deviceIndex, deviceConnectionId)) {
-    try {
-      const result = await runAdminSessionCommand<FolderListResult & SessionPayload>(
-        deviceIndex,
-        deviceConnectionId,
-        'list',
-        [String(storageId), String(parentId)],
-        180_000,
-        reportProgress
-      );
-      return helperMetadata(result, adminSession?.stderrBuffer);
-    } catch (error) {
-      appendLog(`admin session list failed: ${String(error)}`);
-      return helperMetadata(
-        {
-          ...fallback,
-          state: normalMtpAccessBlocked(error, adminSession?.stderrBuffer ?? '') ? 'connect-error' : fallback.state,
-          message: sessionErrorMessage(fallback.message, error, adminSession?.stderrBuffer ?? '')
-        },
-        adminSession?.stderrBuffer
-      );
-    }
-  }
 
   try {
     const result = await runSessionCommand<FolderListResult & SessionPayload>(
@@ -1955,21 +2352,338 @@ async function listFolder(
       180_000,
       reportProgress
     );
-    return helperMetadata(result, lastSessionStderr);
+    if (!result.ok && parentId === MTP_ROOT_PARENT_ID) {
+      appendLog(
+        `session root listing failed for ${deviceConnectionId}; keeping the persistent session open for an explicit storage retry`
+      );
+      return helperMetadata(
+        {
+          ...result,
+          state: 'connect-error',
+          connectionPhase: 'needs-mode-reset',
+          connectionIssue: 'storage-unavailable',
+          message: PHONE_FILES_UNAVAILABLE_MESSAGE,
+          fileAccessUnavailable: true
+        },
+        lastSessionStderr
+      );
+    }
+    return helperMetadata(
+      {
+        ...result,
+        connectionPhase: result.ok ? 'ready' : 'needs-mode-reset',
+        connectionIssue: result.ok ? undefined : 'unknown'
+      },
+      lastSessionStderr
+    );
   } catch (error) {
     appendLog(`session list failed: ${String(error)}`);
-    const accessBlocked = await normalMtpAccessBlockedAfterRefresh(error, lastSessionStderr);
+    const issue = classifyMtpConnectionIssue(error, lastSessionStderr);
     return helperMetadata(
       {
         ...fallback,
-        state: accessBlocked ? 'connect-error' : fallback.state,
-        message: accessBlocked
-          ? blockedMtpAccessMessage()
-          : sessionErrorMessage(fallback.message, error, lastSessionStderr)
+        state: 'connect-error',
+        connectionPhase: connectionPhaseForIssue(issue),
+        connectionIssue: issue,
+        message: sessionErrorMessage(fallback.message, error, lastSessionStderr)
       },
       lastSessionStderr
     );
   }
+}
+
+function isUint32(value: unknown, allowZero: boolean): value is number {
+  return Number.isInteger(value) &&
+    typeof value === 'number' &&
+    value >= (allowZero ? 0 : 1) &&
+    value <= 0xffffffff;
+}
+
+function phoneMutationTargetError(target: PhoneMutationTarget | null | undefined): string | null {
+  if (!target || typeof target !== 'object') {
+    return 'No phone item was selected.';
+  }
+  if (!isUint32(target.objectId, false) ||
+      !isUint32(target.storageId, false) ||
+      !isUint32(target.parentId, true)) {
+    return 'The selected phone item has invalid metadata. Refresh the folder and try again.';
+  }
+  if (target.kind !== 'file' && target.kind !== 'folder') {
+    return 'Only phone files and folders can be changed.';
+  }
+  if (target.kind === 'file') {
+    if (typeof target.size !== 'number' || !Number.isSafeInteger(target.size) || target.size < 0) {
+      return 'The selected phone file has invalid size metadata. Refresh the folder and try again.';
+    }
+    if (
+      target.modified !== undefined &&
+      (typeof target.modified !== 'number' || !Number.isSafeInteger(target.modified) || target.modified <= 0)
+    ) {
+      return 'The selected phone file has invalid modification metadata. Refresh the folder and try again.';
+    }
+  } else if (target.size !== undefined || target.modified !== undefined) {
+    return 'The selected phone folder has unexpected file metadata. Refresh the folder and try again.';
+  }
+  if (!target.name || target.name.includes('\0') || encodePhoneCommandName(target.name).length > 510) {
+    return 'The selected phone item has an invalid name. Refresh the folder and try again.';
+  }
+  return null;
+}
+
+function phoneMutationUnavailableMessage(): string | null {
+  if (phoneMutationInProgress) {
+    return 'Another phone change is still in progress.';
+  }
+  if (pendingPromisePlanningCount > 0) {
+    return 'Wait for the accepted drag to finish listing its phone folder.';
+  }
+  if ([...transferJobs.values()].some((job) => job.status === 'queued' || job.status === 'active')) {
+    return 'Wait for the transfer queue to finish before changing phone items.';
+  }
+  return null;
+}
+
+async function runPhoneMutationCommand(
+  deviceIndex: number,
+  deviceConnectionId: string,
+  command: 'rename-item' | 'delete-item',
+  args: string[]
+): Promise<{ result: SessionPayload; stderr: string }> {
+  const result = await runSessionCommand<SessionPayload>(
+    deviceIndex,
+    deviceConnectionId,
+    command,
+    args,
+    60_000
+  );
+  return { result, stderr: lastSessionStderr };
+}
+
+function phoneMutationArgs(target: PhoneMutationTarget): string[] {
+  return [
+    String(target.objectId),
+    String(target.storageId),
+    String(target.parentId),
+    target.kind,
+    target.kind === 'file' ? String(target.size) : '-',
+    target.kind === 'file' && target.modified !== undefined ? String(target.modified) : '-',
+    encodePhoneCommandName(target.name)
+  ];
+}
+
+async function renamePhoneItem(request: RenamePhoneItemRequest): Promise<RenamePhoneItemResult> {
+  const fallback: RenamePhoneItemResult = {
+    ok: false,
+    state: 'error',
+    message: 'Unable to rename the selected phone item.',
+    objectId: request?.target?.objectId ?? 0,
+    helperPath: getBridgePath(),
+    logPath: getLogPath()
+  };
+  if (!request || !Number.isInteger(request.deviceIndex) || request.deviceIndex < 0 ||
+      typeof request.deviceConnectionId !== 'string' || !request.deviceConnectionId) {
+    return { ...fallback, message: 'The phone connection changed. Refresh the folder and try again.' };
+  }
+  const targetError = phoneMutationTargetError(request.target);
+  if (targetError) {
+    return { ...fallback, message: targetError };
+  }
+  const nameError = validatePhoneItemName(request.newName);
+  if (nameError) {
+    return { ...fallback, message: nameError };
+  }
+  if (request.newName === request.target.name) {
+    return helperMetadata({
+      ...fallback,
+      ok: true,
+      state: 'connected',
+      message: 'The name is unchanged.',
+      actualName: request.target.name,
+      verified: true
+    });
+  }
+  const unavailable = phoneMutationUnavailableMessage();
+  if (unavailable) {
+    return { ...fallback, message: unavailable };
+  }
+
+  phoneMutationInProgress = true;
+  try {
+    const { result, stderr } = await runPhoneMutationCommand(
+      request.deviceIndex,
+      request.deviceConnectionId,
+      'rename-item',
+      [...phoneMutationArgs(request.target), encodePhoneCommandName(request.newName)]
+    );
+    const actualName = typeof result.actualName === 'string' && result.actualName
+      ? result.actualName
+      : request.newName;
+    const ok = result.ok === true;
+    appendLog(ok
+      ? `phone item renamed: ${request.target.name} -> ${actualName}`
+      : `phone item rename failed: ${request.target.name}: ${result.message || fallback.message}`);
+    return helperMetadata({
+      ...fallback,
+      ok,
+      state: ok ? 'connected' : 'error',
+      message: ok
+        ? result.verified === false
+          ? `Renamed to ${actualName}, but the phone did not return updated metadata. Refresh the folder to confirm.`
+          : `Renamed to ${actualName}.`
+        : result.message || fallback.message,
+      actualName: ok ? actualName : undefined,
+      verified: result.verified === true
+    }, stderr);
+  } catch (error) {
+    const stderr = lastSessionStderr;
+    appendLog(`phone item rename failed: ${request.target.name}: ${String(error)}`);
+    const accessBlocked = await normalMtpAccessBlockedAfterRefresh(error, stderr);
+    return helperMetadata({
+      ...fallback,
+      state: accessBlocked ? 'connect-error' : 'error',
+      message: accessBlocked
+        ? blockedMtpAccessMessage()
+        : sessionErrorMessage(fallback.message, error, stderr)
+    }, stderr);
+  } finally {
+    phoneMutationInProgress = false;
+    processTransferQueue();
+  }
+}
+
+function mutationDisplayName(name: string): string {
+  return name.replace(/[\r\n\t]/g, ' ');
+}
+
+async function confirmPhoneDeletion(targets: PhoneMutationTarget[]): Promise<boolean> {
+  const shownNames = targets.slice(0, 6).map((target) => `• ${mutationDisplayName(target.name)}`);
+  if (targets.length > shownNames.length) {
+    shownNames.push(`• and ${targets.length - shownNames.length} more`);
+  }
+  const folderWarning = targets.some((target) => target.kind === 'folder')
+    ? 'Deleting a folder also permanently deletes everything inside it.\n\n'
+    : '';
+  const options = {
+    type: 'warning' as const,
+    buttons: ['Delete Permanently', 'Cancel'],
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+    title: 'Delete from phone?',
+    message: `Permanently delete ${targets.length} ${targets.length === 1 ? 'item' : 'items'} from the phone?`,
+    detail: `${folderWarning}There is no Trash or Undo for phone files.\n\n${shownNames.join('\n')}`
+  };
+  const result = mainWindow
+    ? await dialog.showMessageBox(mainWindow, options)
+    : await dialog.showMessageBox(options);
+  return result.response === 0;
+}
+
+async function deletePhoneItems(request: DeletePhoneItemsRequest): Promise<DeletePhoneItemsResult> {
+  const fallback: DeletePhoneItemsResult = {
+    confirmed: false,
+    ok: false,
+    state: 'error',
+    message: 'Unable to delete the selected phone items.',
+    deletedObjectIds: [],
+    failures: [],
+    helperPath: getBridgePath(),
+    logPath: getLogPath()
+  };
+  if (!request || !Number.isInteger(request.deviceIndex) || request.deviceIndex < 0 ||
+      typeof request.deviceConnectionId !== 'string' || !request.deviceConnectionId ||
+      !Array.isArray(request.targets) || request.targets.length === 0) {
+    return { ...fallback, message: 'Select at least one phone file or folder.' };
+  }
+  if (request.targets.length > MAX_PHONE_MUTATION_ITEMS) {
+    return { ...fallback, message: `Delete at most ${MAX_PHONE_MUTATION_ITEMS} items at once.` };
+  }
+
+  const targets: PhoneMutationTarget[] = [];
+  const seenObjectIds = new Set<number>();
+  for (const target of request.targets) {
+    const targetError = phoneMutationTargetError(target);
+    if (targetError) {
+      return { ...fallback, message: targetError };
+    }
+    if (!seenObjectIds.has(target.objectId)) {
+      seenObjectIds.add(target.objectId);
+      targets.push(target);
+    }
+  }
+  const unavailable = phoneMutationUnavailableMessage();
+  if (unavailable) {
+    return { ...fallback, message: unavailable };
+  }
+  if (!(await confirmPhoneDeletion(targets))) {
+    return helperMetadata({
+      ...fallback,
+      confirmed: false,
+      ok: true,
+      state: 'connected',
+      message: 'Deletion canceled.'
+    });
+  }
+  const unavailableAfterConfirmation = phoneMutationUnavailableMessage();
+  if (unavailableAfterConfirmation) {
+    return { ...fallback, confirmed: true, message: unavailableAfterConfirmation };
+  }
+
+  phoneMutationInProgress = true;
+  const deletedObjectIds: number[] = [];
+  const failures: DeletePhoneItemFailure[] = [];
+  let stderr = '';
+  try {
+    for (let index = 0; index < targets.length; index++) {
+      const target = targets[index];
+      try {
+        const response = await runPhoneMutationCommand(
+          request.deviceIndex,
+          request.deviceConnectionId,
+          'delete-item',
+          phoneMutationArgs(target)
+        );
+        stderr = response.stderr || stderr;
+        if (response.result.ok) {
+          deletedObjectIds.push(target.objectId);
+          appendLog(`phone item deleted: ${target.name} (${target.objectId})`);
+        } else {
+          const message = response.result.message || 'The phone could not permanently delete this item.';
+          failures.push({ target, message });
+          appendLog(`phone item delete failed: ${target.name}: ${message}`);
+        }
+      } catch (error) {
+        stderr = lastSessionStderr || stderr;
+        const message = sessionErrorMessage('The phone session stopped before this item was deleted.', error, stderr);
+        failures.push({ target, message });
+        for (const remaining of targets.slice(index + 1)) {
+          failures.push({ target: remaining, message: 'Not attempted because the phone session stopped.' });
+        }
+        appendLog(`phone item delete session failed: ${target.name}: ${String(error)}`);
+        break;
+      }
+    }
+  } finally {
+    phoneMutationInProgress = false;
+    processTransferQueue();
+  }
+
+  const ok = failures.length === 0;
+  const deletedCount = deletedObjectIds.length;
+  const message = ok
+    ? `Permanently deleted ${deletedCount} ${deletedCount === 1 ? 'item' : 'items'} from the phone.`
+    : deletedCount > 0
+      ? `Deleted ${deletedCount} ${deletedCount === 1 ? 'item' : 'items'}; ${failures.length} could not be deleted.`
+      : failures[0]?.message || fallback.message;
+  return helperMetadata({
+    ...fallback,
+    confirmed: true,
+    ok,
+    state: ok ? 'connected' : 'error',
+    message,
+    deletedObjectIds,
+    failures
+  }, stderr);
 }
 
 async function createPhoneFolder(request: CreateFolderRequest): Promise<CreateFolderResult> {
@@ -2013,29 +2727,6 @@ async function createPhoneFolder(request: CreateFolderRequest): Promise<CreateFo
       stderr
     );
   };
-
-  if (await adminFallbackIsAvailable(request.deviceIndex, request.deviceConnectionId)) {
-    try {
-      const result = await runAdminSessionCommand<SessionPayload>(
-        request.deviceIndex,
-        request.deviceConnectionId,
-        'mkdir',
-        [String(request.storageId), String(request.parentId), folderName],
-        60_000
-      );
-      return normalizeResult(result, adminSession?.stderrBuffer);
-    } catch (error) {
-      appendLog(`admin session mkdir failed: ${String(error)}`);
-      return helperMetadata(
-        {
-          ...fallback,
-          state: normalMtpAccessBlocked(error, adminSession?.stderrBuffer ?? '') ? 'connect-error' : fallback.state,
-          message: sessionErrorMessage(fallback.message, error, adminSession?.stderrBuffer ?? '')
-        },
-        adminSession?.stderrBuffer
-      );
-    }
-  }
 
   try {
     const result = await runSessionCommand<SessionPayload>(
@@ -2147,6 +2838,15 @@ function finalizeDownloadedFile(job: TransferJob): void {
       temporaryPath,
       destinationPath: job.destinationPath,
       expectedSize: job.size
+    });
+    job.originalDestinationPath = job.destinationPath;
+    job.renamedDestination = false;
+  } else if (job.direction === 'download' && job.collisionAction === 'replace' && job.destinationIdentity) {
+    replaceTemporaryFile({
+      temporaryPath,
+      destinationPath: job.destinationPath,
+      expectedSize: job.size,
+      expectedExisting: job.destinationIdentity
     });
     job.originalDestinationPath = job.destinationPath;
     job.renamedDestination = false;
@@ -2320,7 +3020,14 @@ function localEntryForPath(entryPath: string): LocalEntry | null {
       kind: isFolder ? 'folder' : 'file',
       size: isFile ? entryStat.size : 0,
       modified: Math.floor(entryStat.mtimeMs / 1000),
-      type: isFolder ? 'Folder' : localTypeForName(name)
+      type: isFolder ? 'Folder' : localTypeForName(name),
+      identity: {
+        device: entryStat.dev,
+        inode: entryStat.ino,
+        size: entryStat.size,
+        modifiedMs: entryStat.mtimeMs,
+        changedMs: entryStat.ctimeMs
+      }
     };
   } catch (error) {
     appendLog(`local path skipped: ${entryPath}: ${String(error)}`);
@@ -2424,6 +3131,171 @@ function ensureLocalDirectory(directoryPath: string): LocalDirectoryResult {
   return listLocalDirectory(targetPath);
 }
 
+function localMutationUnavailableMessage(): string | null {
+  if (localMutationInProgress) {
+    return 'Another Mac file change is still in progress.';
+  }
+  if ([...transferJobs.values()].some((job) => job.status === 'queued' || job.status === 'active')) {
+    return 'Wait for the transfer queue to finish before changing Mac items.';
+  }
+  return null;
+}
+
+function localIdentityMatches(targetPath: string, target: LocalMutationTarget): boolean {
+  const current = lstatSync(targetPath);
+  return !current.isSymbolicLink() &&
+    (target.kind === 'folder' ? current.isDirectory() : current.isFile()) &&
+    current.dev === target.identity.device &&
+    current.ino === target.identity.inode &&
+    current.size === target.identity.size &&
+    current.mtimeMs === target.identity.modifiedMs &&
+    current.ctimeMs === target.identity.changedMs;
+}
+
+function verifiedLocalMutationPath(
+  directoryPath: string,
+  target: LocalMutationTarget
+): { directory: string; sourcePath: string } {
+  const directory = resolve(directoryPath);
+  const sourcePath = resolve(target.path);
+  const directoryStat = lstatSync(directory);
+  if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+    throw new Error('The open Mac folder is no longer available.');
+  }
+  if (dirname(sourcePath) !== directory || basename(sourcePath) !== target.name) {
+    throw new Error('The selected Mac item is outside the open folder.');
+  }
+  if (!target.identity || !localIdentityMatches(sourcePath, target)) {
+    throw new Error('The selected Mac item changed since it was listed. Refresh the folder and try again.');
+  }
+  return { directory, sourcePath };
+}
+
+function createLocalFolder(request: CreateLocalFolderRequest): LocalMutationResult {
+  const nameError = validateLocalItemName(request?.name ?? '');
+  if (!request || typeof request.directoryPath !== 'string' || !request.directoryPath || nameError) {
+    return { ok: false, message: nameError || 'Open a Mac folder first.' };
+  }
+  const unavailable = localMutationUnavailableMessage();
+  if (unavailable) {
+    return { ok: false, message: unavailable };
+  }
+  localMutationInProgress = true;
+  try {
+    const directory = resolve(request.directoryPath);
+    const directoryStat = lstatSync(directory);
+    if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+      throw new Error('The open Mac folder is no longer available.');
+    }
+    const targetPath = resolve(directory, request.name);
+    if (dirname(targetPath) !== directory || existsSync(targetPath)) {
+      throw new Error(existsSync(targetPath) ? 'An item with that name is already here.' : 'That folder name is not valid here.');
+    }
+    mkdirSync(targetPath, { recursive: false });
+    const entry = localEntryForPath(targetPath);
+    if (!entry) {
+      appendLog(`local folder created but not immediately readable: ${targetPath}`);
+      return { ok: true, message: 'The folder was created. Refresh to show it.' };
+    }
+    appendLog(`local folder created: ${targetPath}`);
+    return { ok: true, message: `Created ${request.name}.`, entry };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unable to create that Mac folder.';
+    appendLog(`local folder create failed: ${String(error)}`);
+    return { ok: false, message };
+  } finally {
+    localMutationInProgress = false;
+    processTransferQueue();
+  }
+}
+
+function renameLocalItem(request: RenameLocalItemRequest): LocalMutationResult {
+  const nameError = validateLocalItemName(request?.newName ?? '');
+  if (!request || !request.target || nameError) {
+    return { ok: false, message: nameError || 'Select one Mac item to rename.' };
+  }
+  const unavailable = localMutationUnavailableMessage();
+  if (unavailable) {
+    return { ok: false, message: unavailable };
+  }
+  localMutationInProgress = true;
+  try {
+    const { directory, sourcePath } = verifiedLocalMutationPath(request.directoryPath, request.target);
+    if (request.newName === request.target.name) {
+      return { ok: true, message: 'The name is unchanged.', entry: localEntryForPath(sourcePath) ?? undefined };
+    }
+    const destinationPath = resolve(directory, request.newName);
+    if (dirname(destinationPath) !== directory) {
+      throw new Error('That name is not valid here.');
+    }
+    if (existsSync(destinationPath)) {
+      throw new Error('An item with that name is already here.');
+    }
+    renameSync(sourcePath, destinationPath);
+    const entry = localEntryForPath(destinationPath);
+    if (!entry) {
+      appendLog(`local item renamed but not immediately readable: ${sourcePath} -> ${destinationPath}`);
+      return { ok: true, message: 'The item was renamed. Refresh to show it.' };
+    }
+    appendLog(`local item renamed: ${sourcePath} -> ${destinationPath}`);
+    return { ok: true, message: `Renamed to ${request.newName}.`, entry };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unable to rename that Mac item.';
+    appendLog(`local item rename failed: ${String(error)}`);
+    return { ok: false, message };
+  } finally {
+    localMutationInProgress = false;
+    processTransferQueue();
+  }
+}
+
+async function trashLocalItems(request: TrashLocalItemsRequest): Promise<TrashLocalItemsResult> {
+  const fallback = { ok: false, message: 'Unable to move the selected items to Trash.', trashedPaths: [], failures: [] };
+  if (!request || !Array.isArray(request.targets) || request.targets.length === 0 || request.targets.length > 1_000) {
+    return { ...fallback, message: 'Select between 1 and 1,000 Mac items.' };
+  }
+  const unavailable = localMutationUnavailableMessage();
+  if (unavailable) {
+    return { ...fallback, message: unavailable };
+  }
+  localMutationInProgress = true;
+  const trashedPaths: string[] = [];
+  const failures: TrashLocalItemFailure[] = [];
+  try {
+    const seenPaths = new Set<string>();
+    for (const target of request.targets) {
+      if (!target || seenPaths.has(target.path)) {
+        continue;
+      }
+      seenPaths.add(target.path);
+      try {
+        const { sourcePath } = verifiedLocalMutationPath(request.directoryPath, target);
+        await shell.trashItem(sourcePath);
+        trashedPaths.push(sourcePath);
+        appendLog(`local item moved to Trash: ${sourcePath}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unable to move this item to Trash.';
+        failures.push({ target, message });
+        appendLog(`local item trash failed: ${target.path}: ${String(error)}`);
+      }
+    }
+  } finally {
+    localMutationInProgress = false;
+    processTransferQueue();
+  }
+  const ok = failures.length === 0;
+  return {
+    ok,
+    message: ok
+      ? `Moved ${trashedPaths.length} ${trashedPaths.length === 1 ? 'item' : 'items'} to Trash.`
+      : trashedPaths.length
+        ? `Moved ${trashedPaths.length} to Trash; ${failures.length} could not be moved.`
+        : failures[0]?.message || fallback.message,
+    trashedPaths,
+    failures
+  };
+}
+
 function setLocalModifiedTime(localPath: string, modified: number): LocalModifiedTimeResult {
   const targetPath = resolve(localPath);
   if (!Number.isFinite(modified) || modified <= 0) {
@@ -2468,6 +3340,43 @@ function nextQueuedJob(): TransferJob | undefined {
   return Array.from(transferJobs.values()).find((job) => job.status === 'queued');
 }
 
+function sameLocalSourceIdentity(
+  current: LocalSourceIdentity,
+  queued: LocalSourceIdentity
+): boolean {
+  return current.device === queued.device &&
+    current.inode === queued.inode &&
+    current.size === queued.size &&
+    current.modifiedMs === queued.modifiedMs &&
+    current.changedMs === queued.changedMs;
+}
+
+function shouldReportTransferCanceled(
+  cancellationRequested: boolean,
+  phoneReplacementStarted: boolean
+): boolean {
+  return cancellationRequested && !phoneReplacementStarted;
+}
+
+function uploadSourceIdentityError(job: TransferJob): string | null {
+  if (job.direction !== 'upload') {
+    return null;
+  }
+  if (!job.sourcePath || !job.sourceIdentity) {
+    return 'The queued Mac source identity is missing. Queue the file again.';
+  }
+
+  try {
+    const current = fileIdentitySnapshot(job.sourcePath);
+    if (sameLocalSourceIdentity(current, job.sourceIdentity)) {
+      return null;
+    }
+  } catch {
+    // Missing, unreadable, non-file, and symbolic-link replacements are all stale sources.
+  }
+  return 'The Mac source changed after it was queued, so it was not uploaded.';
+}
+
 async function requireCurrentPhoneConnection(job: TransferJob): Promise<void> {
   let rawDevice = rawDeviceForConnection(job.deviceIndex, job.deviceConnectionId);
   if (!rawDevice) {
@@ -2509,12 +3418,32 @@ function handleTransferPayload(job: TransferJob, payload: SessionPayload): void 
 
 function transferCommandForJob(job: TransferJob): { commandName: string; args: string[] } {
   if (job.direction === 'upload') {
-    if (job.storageId === undefined || job.parentId === undefined || !job.sourcePath) {
-      throw new Error('Upload job is missing its phone destination or Mac source path.');
+    if (
+      job.storageId === undefined ||
+      job.parentId === undefined ||
+      !job.sourcePath ||
+      !job.sourceIdentity
+    ) {
+      throw new Error('Upload job is missing its phone destination or verified Mac source identity.');
+    }
+    const destinationName = job.uploadStagingName || job.uploadName || job.name;
+    const nameError = validatePhoneItemName(destinationName);
+    if (nameError) {
+      throw new Error(nameError);
     }
     return {
       commandName: 'upload',
-      args: [String(job.storageId), String(job.parentId), job.sourcePath]
+      args: [
+        String(job.storageId),
+        String(job.parentId),
+        encodePhoneCommandName(destinationName),
+        String(job.sourceIdentity.device),
+        String(job.sourceIdentity.inode),
+        String(job.sourceIdentity.size),
+        String(job.sourceIdentity.modifiedMs),
+        String(job.sourceIdentity.changedMs),
+        job.sourcePath
+      ]
     };
   }
 
@@ -2527,10 +3456,115 @@ function transferCommandForJob(job: TransferJob): { commandName: string; args: s
   };
 }
 
+async function runTransferSessionCommand<T extends SessionPayload>(
+  job: TransferJob,
+  commandName: string,
+  args: string[],
+  timeoutMs: number,
+  onEvent?: (payload: SessionPayload) => void
+): Promise<T> {
+  return runSessionCommand<T>(
+    job.deviceIndex,
+    job.deviceConnectionId,
+    commandName,
+    args,
+    timeoutMs,
+    onEvent
+  );
+}
+
+function phoneFileMutationTarget(
+  job: TransferJob,
+  objectId: number,
+  name: string,
+  modified?: number
+): PhoneMutationTarget {
+  if (job.storageId === undefined || job.parentId === undefined) {
+    throw new Error('The transfer no longer has its phone item metadata.');
+  }
+  return {
+    objectId,
+    storageId: job.storageId,
+    parentId: job.parentId,
+    name,
+    kind: 'file',
+    size: job.size,
+    modified: Number.isSafeInteger(modified) && (modified ?? 0) > 0 ? modified : undefined
+  };
+}
+
+function uploadedPhoneTarget(job: TransferJob, objectId: number, name: string): PhoneMutationTarget {
+  return phoneFileMutationTarget(job, objectId, name);
+}
+
+async function runTransferPhoneMutation(
+  job: TransferJob,
+  command: 'rename-item' | 'delete-item',
+  target: PhoneMutationTarget,
+  newName?: string
+): Promise<SessionPayload> {
+  const args = phoneMutationArgs(target);
+  if (command === 'rename-item') {
+    if (!newName || validatePhoneItemName(newName)) {
+      throw new Error('The replacement transaction produced an invalid phone filename.');
+    }
+    args.push(encodePhoneCommandName(newName));
+  }
+  return runTransferSessionCommand<SessionPayload>(
+    job,
+    command,
+    args,
+    60_000
+  );
+}
+
+async function finalizePhoneReplacement(
+  job: TransferJob,
+  uploadResult: SessionPayload
+): Promise<SessionPayload> {
+  const existing = job.replacementTarget;
+  const stageName = job.uploadStagingName;
+  const backupName = job.uploadBackupName;
+  const finalName = job.uploadName || job.name;
+  if (!existing || !stageName || !backupName) {
+    return uploadResult;
+  }
+
+  if (!uploadResult.objectId || uploadResult.verified !== true) {
+    if (uploadResult.objectId) {
+      const unverifiedStage = uploadedPhoneTarget(job, uploadResult.objectId, stageName);
+      try {
+        const cleanup = await runTransferPhoneMutation(
+          job,
+          'delete-item',
+          unverifiedStage
+        );
+        if (!cleanup.ok) {
+          appendLog(`warning: unable to remove unverified staged phone upload ${stageName}: ${cleanup.message || 'unknown error'}`);
+        }
+      } catch (error) {
+        appendLog(`warning: unable to remove unverified staged phone upload ${stageName}: ${String(error)}`);
+      }
+    }
+    throw new Error('The new phone copy could not be verified, so the existing file was kept.');
+  }
+
+  const staged = uploadedPhoneTarget(job, uploadResult.objectId, stageName);
+  const published = await publishStagedPhoneReplacement({
+    existing,
+    staged,
+    finalName,
+    backupName,
+    mutate: (command, target, newName) =>
+      runTransferPhoneMutation(job, command, target, newName),
+    onCleanupWarning: (message) => appendLog(`warning: unable to remove staged phone upload: ${message}`)
+  });
+  return { ...uploadResult, message: published.message };
+}
+
 async function removeMoveSource(
   job: TransferJob,
-  transferResult: SessionPayload,
-  usesAdminSession: boolean
+  transferResult: SessionPayload
 ): Promise<void> {
   job.sourceRemovalStatus = 'pending';
   job.sourceRemovalError = undefined;
@@ -2540,21 +3574,12 @@ async function removeMoveSource(
       if (job.objectId === undefined) {
         throw new Error('The completed copy no longer has a phone source identifier.');
       }
-      const deleteResult = usesAdminSession
-        ? await runAdminSessionCommand<SessionPayload>(
-            job.deviceIndex,
-            job.deviceConnectionId,
-            'delete',
-            [String(job.objectId)],
-            TRANSFER_COMMAND_IDLE_TIMEOUT_MS
-          )
-        : await runSessionCommand<SessionPayload>(
-            job.deviceIndex,
-            job.deviceConnectionId,
-            'delete',
-            [String(job.objectId)],
-            TRANSFER_COMMAND_IDLE_TIMEOUT_MS
-          );
+      const sourceTarget = phoneFileMutationTarget(job, job.objectId, job.name, job.modified);
+      const deleteResult = await runTransferPhoneMutation(
+        job,
+        'delete-item',
+        sourceTarget
+      );
       if (!deleteResult.ok || deleteResult.event !== 'complete') {
         throw new Error(deleteResult.message || 'The phone did not delete the source file.');
       }
@@ -2582,7 +3607,7 @@ async function removeMoveSource(
 }
 
 async function runTransferJob(job: TransferJob): Promise<void> {
-  activeTransferUsesAdminSession = false;
+  let phoneReplacementStarted = false;
   const label =
     job.direction === 'upload'
       ? 'upload'
@@ -2594,29 +3619,30 @@ async function runTransferJob(job: TransferJob): Promise<void> {
       job.temporaryPath = temporaryDownloadPath(job.destinationPath);
     }
     const command = transferCommandForJob(job);
-    activeTransferUsesAdminSession = await adminFallbackIsAvailable(
-      job.deviceIndex,
-      job.deviceConnectionId
+    const sourceIdentityError = uploadSourceIdentityError(job);
+    if (sourceIdentityError) {
+      throw new Error(sourceIdentityError);
+    }
+    let result = await runTransferSessionCommand<SessionPayload>(
+      job,
+      command.commandName,
+      command.args,
+      TRANSFER_COMMAND_IDLE_TIMEOUT_MS,
+      (payload) => handleTransferPayload(job, payload)
     );
-    const result = activeTransferUsesAdminSession
-      ? await runAdminSessionCommand<SessionPayload>(
-          job.deviceIndex,
-          job.deviceConnectionId,
-          command.commandName,
-          command.args,
-          TRANSFER_COMMAND_IDLE_TIMEOUT_MS,
-          (payload) => handleTransferPayload(job, payload)
-        )
-      : await runSessionCommand<SessionPayload>(
-          job.deviceIndex,
-          job.deviceConnectionId,
-          command.commandName,
-          command.args,
-          TRANSFER_COMMAND_IDLE_TIMEOUT_MS,
-          (payload) => handleTransferPayload(job, payload)
-        );
 
-    if (activeWasCanceled) {
+    if (
+      !activeWasCanceled &&
+      result.ok &&
+      result.event === 'complete' &&
+      job.direction === 'upload' &&
+      job.collisionAction === 'replace'
+    ) {
+      phoneReplacementStarted = true;
+      result = await finalizePhoneReplacement(job, result);
+    }
+
+    if (shouldReportTransferCanceled(activeWasCanceled, phoneReplacementStarted)) {
       job.status = 'canceled';
       job.error = 'Transfer canceled.';
       appendLog(`${label} canceled: ${job.name}`);
@@ -2625,7 +3651,7 @@ async function runTransferJob(job: TransferJob): Promise<void> {
         finalizeDownloadedFile(job);
       }
       if (job.operation === 'move') {
-        await removeMoveSource(job, result, activeTransferUsesAdminSession);
+        await removeMoveSource(job, result);
       }
       job.status = 'completed';
       job.totalBytes = job.size > 0 ? job.size : job.totalBytes;
@@ -2642,20 +3668,23 @@ async function runTransferJob(job: TransferJob): Promise<void> {
       appendLog(`${label} failed: ${job.name}: ${job.error}`);
     }
   } catch (error) {
-    if (activeWasCanceled) {
+    if (shouldReportTransferCanceled(activeWasCanceled, phoneReplacementStarted)) {
       job.status = 'canceled';
       job.error = 'Transfer canceled.';
       appendLog(`${label} canceled: ${job.name}`);
     } else {
+      const rawFailure = error instanceof Error ? error.message : String(error);
       job.status = 'failed';
-      job.error = sessionErrorMessage('Transfer failed.', error, lastSessionStderr);
+      job.error = phoneReplacementStarted
+        ? `Transfer failed. ${rawFailure}`
+        : sessionErrorMessage('Transfer failed.', error, lastSessionStderr);
       appendLog(`${label} failed: ${job.name}: ${job.error}`);
     }
   } finally {
+    await waitForMtpSessionTeardown();
     cleanupTemporaryDownload(job);
     job.finishedAt = Date.now();
     activeJobId = null;
-    activeTransferUsesAdminSession = false;
 
     if (job.status === 'completed') {
       sendTransferEvent('completed', job);
@@ -2674,14 +3703,28 @@ async function runTransferJob(job: TransferJob): Promise<void> {
 function processTransferQueue(): void {
   if (
     pendingPromisePlanningCount > 0 ||
+    phoneMutationInProgress ||
+    localMutationInProgress ||
+    mtpSessionTeardown !== null ||
     activeJobId !== null ||
-    activeSessionCommand !== null ||
-    adminSession?.activeCommand
+    activeSessionCommand !== null
   ) {
     return;
   }
 
-  const job = nextQueuedJob();
+  let job = nextQueuedJob();
+  while (job) {
+    const sourceError = uploadSourceIdentityError(job);
+    if (!sourceError) {
+      break;
+    }
+    job.status = 'failed';
+    job.error = sourceError;
+    job.finishedAt = Date.now();
+    sendTransferEvent('failed', job);
+    appendLog(`upload not started: ${job.name}: ${sourceError}`);
+    job = nextQueuedJob();
+  }
   if (!job) {
     return;
   }
@@ -2706,17 +3749,28 @@ function processTransferQueue(): void {
 
 function enqueueDownloads(
   requests: TransferRequest[],
-  operation: TransferOperation = 'copy'
+  operation: TransferOperation = 'copy',
+  collisionAction: TransferCollisionAction = 'none'
 ): TransferJob[] {
   const reservedBytesByVolume = new Map<string, number>();
   const reservedPaths = reservedDownloadDestinationPaths();
   const jobs = requests.map((request) => {
     mkdirSync(request.destinationDirectory, { recursive: true });
-    const destination = downloadDestinationPlan(
-      request.destinationDirectory,
-      request.name,
-      reservedPaths
-    );
+    const originalDestinationPath = join(request.destinationDirectory, sanitizeFileName(request.name));
+    let destination = downloadDestinationPlan(request.destinationDirectory, request.name, reservedPaths);
+    let destinationIdentity: LocalSourceIdentity | undefined;
+    if (collisionAction === 'replace' && existsSync(originalDestinationPath)) {
+      try {
+        destinationIdentity = fileIdentitySnapshot(originalDestinationPath);
+        destination = {
+          destinationPath: originalDestinationPath,
+          originalDestinationPath,
+          renamedDestination: false
+        };
+      } catch (error) {
+        appendLog(`download replace changed to keep-both for ${originalDestinationPath}: ${String(error)}`);
+      }
+    }
     reservedPaths.add(destination.destinationPath);
     const job: TransferJob = {
       id: randomUUID(),
@@ -2727,6 +3781,13 @@ function enqueueDownloads(
       storageId: request.storageId,
       parentId: request.parentId,
       objectId: request.objectId,
+      collisionAction:
+        destinationIdentity
+          ? 'replace'
+          : destination.renamedDestination
+            ? 'keep-both'
+            : undefined,
+      destinationIdentity,
       name: request.name,
       size: request.size,
       modified: request.modified,
@@ -2748,6 +3809,63 @@ function enqueueDownloads(
 
   processTransferQueue();
   return jobs;
+}
+
+function requestedDownloadPath(request: TransferRequest): string {
+  return join(request.destinationDirectory, sanitizeFileName(request.name));
+}
+
+async function chooseTransferCollisionAction(
+  direction: 'download' | 'upload',
+  conflictCount: number,
+  destinationLabel: string
+): Promise<TransferCollisionAction> {
+  if (conflictCount <= 0) {
+    return 'none';
+  }
+
+  const destination = direction === 'download' ? 'the Mac folder' : 'the phone folder';
+  const options: MessageBoxOptions = {
+    type: 'warning',
+    buttons: ['Keep Both', 'Replace', 'Skip Existing', 'Cancel'],
+    defaultId: 0,
+    cancelId: 3,
+    noLink: true,
+    title: 'Items with the same name',
+    message: `${conflictCount} ${conflictCount === 1 ? 'item already exists' : 'items already exist'} in ${destinationLabel || destination}.`,
+    detail: direction === 'download'
+      ? 'Keep Both adds a number to the incoming filename. Replace publishes each complete, verified download over the unchanged existing Mac file. Skip Existing copies only new names.'
+      : 'Keep Both adds a number to the incoming filename. Replace stages and verifies the new phone copy before changing the old one. Skip Existing copies only new names.'
+  };
+  const result = mainWindow
+    ? await dialog.showMessageBox(mainWindow, options)
+    : await dialog.showMessageBox(options);
+  return (['keep-both', 'replace', 'skip', 'cancel'] as const)[result.response] ?? 'cancel';
+}
+
+async function queueDownloads(
+  requests: TransferRequest[],
+  operation: TransferOperation = 'copy'
+): Promise<TransferQueueResult> {
+  const conflicts = requests.filter((request) => existsSync(requestedDownloadPath(request)));
+  const collisionAction = await chooseTransferCollisionAction(
+    'download',
+    conflicts.length,
+    requests[0]?.destinationDirectory || 'the selected Mac folder'
+  );
+  if (collisionAction === 'cancel') {
+    return { collisionAction, conflictCount: conflicts.length, skippedCount: requests.length, jobs: [] };
+  }
+
+  const queuedRequests = collisionAction === 'skip'
+    ? requests.filter((request) => !existsSync(requestedDownloadPath(request)))
+    : requests;
+  return {
+    collisionAction,
+    conflictCount: conflicts.length,
+    skippedCount: requests.length - queuedRequests.length,
+    jobs: enqueueDownloads(queuedRequests, operation, collisionAction)
+  };
 }
 
 function enqueuePromisedDownloads(
@@ -2796,7 +3914,8 @@ function enqueuePromisedDownloads(
 
 function enqueueUploads(
   requests: UploadRequest[],
-  operation: TransferOperation = 'copy'
+  operation: TransferOperation = 'copy',
+  collisionAction: TransferCollisionAction = 'none'
 ): TransferJob[] {
   const jobs = requests.flatMap((request) => {
     if (!request.sourcePath) {
@@ -2810,19 +3929,40 @@ function enqueueUploads(
       if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) {
         return [];
       }
-      fileSize = sourceStat.size;
-      sourceIdentity = {
+      const currentSourceIdentity: LocalSourceIdentity = {
         device: sourceStat.dev,
         inode: sourceStat.ino,
         size: sourceStat.size,
         modifiedMs: sourceStat.mtimeMs,
         changedMs: sourceStat.ctimeMs
       };
+      if (
+        !request.sourceIdentity ||
+        !sameLocalSourceIdentity(currentSourceIdentity, request.sourceIdentity)
+      ) {
+        return [];
+      }
+      fileSize = currentSourceIdentity.size;
+      sourceIdentity = request.sourceIdentity;
     } catch {
       return [];
     }
 
-    const destinationPath = `mtp://${request.storageId}/${request.parentId}/${request.name}`;
+    const replacementTarget =
+      collisionAction === 'replace' ? validUploadReplacementTarget(request) : undefined;
+    let uploadName = request.name;
+    if (collisionAction === 'keep-both' && validUploadReplacementTarget(request)) {
+      const requestedKeepBothName = request.keepBothName?.trim() || keepBothPhoneName(request.name);
+      uploadName = validatePhoneItemName(requestedKeepBothName) ? keepBothPhoneName(request.name) : requestedKeepBothName;
+    }
+    const replacementIdentifier = replacementTarget ? randomUUID() : '';
+    const uploadStagingName = replacementTarget
+      ? temporaryPhoneTransferName(request.name, 'stage', replacementIdentifier)
+      : undefined;
+    const uploadBackupName = replacementTarget
+      ? temporaryPhoneTransferName(request.name, 'backup', replacementIdentifier)
+      : undefined;
+    const destinationPath = `mtp://${request.storageId}/${request.parentId}/${uploadName}`;
     const job: TransferJob = {
       id: randomUUID(),
       direction: 'upload',
@@ -2833,6 +3973,16 @@ function enqueueUploads(
       parentId: request.parentId,
       sourcePath: request.sourcePath,
       sourceIdentity,
+      collisionAction: replacementTarget
+        ? 'replace'
+        : uploadName !== request.name
+          ? 'keep-both'
+          : undefined,
+      originalName: request.name,
+      uploadName,
+      uploadStagingName,
+      uploadBackupName,
+      replacementTarget,
       name: request.name,
       size: fileSize,
       destinationDirectory: 'Phone folder',
@@ -2850,6 +4000,45 @@ function enqueueUploads(
 
   processTransferQueue();
   return jobs;
+}
+
+function validUploadReplacementTarget(request: UploadRequest): PhoneMutationTarget | undefined {
+  const target = request.existingDestination;
+  if (
+    phoneMutationTargetError(target) ||
+    target?.kind !== 'file' ||
+    target.storageId !== request.storageId ||
+    target.parentId !== request.parentId ||
+    target.name !== request.name
+  ) {
+    return undefined;
+  }
+  return target;
+}
+
+async function queueUploads(
+  requests: UploadRequest[],
+  operation: TransferOperation = 'copy'
+): Promise<TransferQueueResult> {
+  const conflicts = requests.filter((request) => validUploadReplacementTarget(request));
+  const collisionAction = await chooseTransferCollisionAction(
+    'upload',
+    conflicts.length,
+    'the open phone folder'
+  );
+  if (collisionAction === 'cancel') {
+    return { collisionAction, conflictCount: conflicts.length, skippedCount: requests.length, jobs: [] };
+  }
+
+  const queuedRequests = collisionAction === 'skip'
+    ? requests.filter((request) => !validUploadReplacementTarget(request))
+    : requests;
+  return {
+    collisionAction,
+    conflictCount: conflicts.length,
+    skippedCount: requests.length - queuedRequests.length,
+    jobs: enqueueUploads(queuedRequests, operation, collisionAction)
+  };
 }
 
 async function confirmFileMove(
@@ -2886,23 +4075,34 @@ async function confirmFileMove(
 async function enqueueMoveDownloads(requests: TransferRequest[]): Promise<MoveQueueResult> {
   const destinationLabel = requests[0]?.destinationDirectory || 'the selected Mac folder';
   const confirmed = await confirmFileMove('download', requests.length, destinationLabel);
+  const queued = confirmed
+    ? await queueDownloads(requests, 'move')
+    : { collisionAction: 'cancel' as const, conflictCount: 0, skippedCount: 0, jobs: [] };
   return {
     confirmed,
-    jobs: confirmed ? enqueueDownloads(requests, 'move') : []
+    ...queued
   };
 }
 
 async function enqueueMoveUploads(requests: UploadRequest[]): Promise<MoveQueueResult> {
   const confirmed = await confirmFileMove('upload', requests.length, 'the open phone folder');
+  const queued = confirmed
+    ? await queueUploads(requests, 'move')
+    : { collisionAction: 'cancel' as const, conflictCount: 0, skippedCount: 0, jobs: [] };
   return {
     confirmed,
-    jobs: confirmed ? enqueueUploads(requests, 'move') : []
+    ...queued
   };
 }
 
 function retryTransfer(jobId: string): TransferJob | null {
   const job = transferJobs.get(jobId);
-  if (!job || job.promiseId || (job.status !== 'failed' && job.status !== 'canceled')) {
+  if (
+    !job ||
+    job.promiseId ||
+    (job.direction === 'upload' && job.collisionAction === 'replace') ||
+    (job.status !== 'failed' && job.status !== 'canceled')
+  ) {
     return null;
   }
 
@@ -2915,6 +4115,8 @@ function retryTransfer(jobId: string): TransferJob | null {
     job.destinationPath = destination.destinationPath;
     job.originalDestinationPath = destination.originalDestinationPath;
     job.renamedDestination = destination.renamedDestination;
+    job.collisionAction = destination.renamedDestination ? 'keep-both' : undefined;
+    job.destinationIdentity = undefined;
   }
   job.error = undefined;
   job.resultMessage = undefined;
@@ -2955,11 +4157,7 @@ function cancelTransfer(jobId: string): TransferJob | null {
 
   if (job.id === activeJobId) {
     activeWasCanceled = true;
-    if (activeTransferUsesAdminSession) {
-      destroyAdminMtpSession('Active protected transfer canceled.', true);
-    } else {
-      destroyMtpSession('Active transfer canceled.', true);
-    }
+    destroyMtpSession('Active transfer canceled.', true);
     return cloneJob(job);
   }
 
@@ -3108,7 +4306,7 @@ function handlePromiseTransferTerminal(job: TransferJob): void {
 
 async function waitForPromisePlanningSlot(): Promise<void> {
   pendingPromisePlanningCount += 1;
-  while (activeJobId !== null || activeSessionCommand !== null || adminSession?.activeCommand) {
+  while (activeJobId !== null || activeSessionCommand !== null) {
     await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 100));
   }
 }
@@ -3379,847 +4577,6 @@ function startPhoneFilePromiseDrag(request: PhoneFilePromiseDragRequest): void {
   }
 }
 
-function runAppleScript(script: string, timeoutMs: number): Promise<{
-  stdout: string;
-  stderr: string;
-  error: Error | null;
-}> {
-  return new Promise((resolvePromise) => {
-    execFile(
-      'osascript',
-      ['-e', script],
-      { maxBuffer: 1024 * 1024 * 20, timeout: timeoutMs },
-      (error, stdout, stderr) => {
-        resolvePromise({
-          stdout,
-          stderr,
-          error: error ?? null
-        });
-      }
-    );
-  });
-}
-
-function adminSessionStartMessage(result: {
-  stdout: string;
-  stderr: string;
-  error: Error | null;
-}): string {
-  const combined = `${result.error?.message ?? ''}\n${result.stderr}\n${result.stdout}`.toLowerCase();
-  const execError = result.error as
-    | (Error & { killed?: boolean; signal?: NodeJS.Signals | string | null; code?: string | number | null })
-    | null;
-
-  if (combined.includes('user canceled') || combined.includes('-128')) {
-    return 'Open files was canceled. Nothing was changed.';
-  }
-
-  if (
-    execError?.killed ||
-    execError?.signal === 'SIGTERM' ||
-    execError?.code === 'ETIMEDOUT' ||
-    combined.includes('timed out') ||
-    combined.includes('etimedout') ||
-    combined.includes('signal sigterm')
-  ) {
-    return 'The Mac password prompt timed out. Click Open files again when you are ready to enter your Mac login password.';
-  }
-
-  const detail =
-    result.stderr.trim() ||
-    result.stdout.trim() ||
-    result.error?.message ||
-    'macOS did not explain why the protected session could not start.';
-  return `macOS did not start protected phone-file access. ${detail}`;
-}
-
-function adminPrompt(rawDevice: RawDevice): string {
-  return [
-    `Android File Transfer for macOS needs your Mac login password because macOS refused normal USB access to ${rawDevice.vendor || rawDevice.product || 'your phone'}.`,
-    'The password lets macOS open the USB connection once; the file helper then immediately returns to your normal account permissions.',
-    'The app reads and copies only the items you choose. It deletes a source file only when you explicitly choose Move, and only after the destination copy is verified.'
-  ].join(' ');
-}
-
-function appendAdminSessionText(session: AdminSessionState, text: string): void {
-  const trimmed = text.trim();
-  if (!trimmed) {
-    return;
-  }
-  appendLog(`admin session output: ${trimmed}`);
-  session.stderrBuffer = `${session.stderrBuffer}\n${trimmed}`.trim();
-  if (session.stderrBuffer.length > 20_000) {
-    session.stderrBuffer = session.stderrBuffer.slice(-20_000);
-  }
-}
-
-function rejectAdminSessionCommands(session: AdminSessionState, error: Error): void {
-  if (session.activeCommand) {
-    if (session.activeCommand.timer) {
-      clearTimeout(session.activeCommand.timer);
-    }
-    session.activeCommand.reject(error);
-    session.activeCommand = null;
-  }
-
-  while (session.queue.length > 0) {
-    const command = session.queue.shift();
-    command?.reject(error);
-  }
-}
-
-function clearAdminReady(session: AdminSessionState, error?: Error): void {
-  if (session.readyTimer) {
-    clearTimeout(session.readyTimer);
-    session.readyTimer = null;
-  }
-
-  if (error && session.readyReject) {
-    session.readyReject(error);
-  }
-
-  session.readyResolve = null;
-  session.readyReject = null;
-}
-
-function finishAdminSessionCommand(session: AdminSessionState, payload: SessionPayload): void {
-  const command = session.activeCommand;
-  if (!command) {
-    appendLog(`admin session response without active command: ${JSON.stringify(payload)}`);
-    return;
-  }
-
-  if (payload.requestId !== command.id) {
-    appendLog(`admin session response id mismatch: ${JSON.stringify(payload)}`);
-    return;
-  }
-
-  clearCommandTimer(command);
-  session.activeCommand = null;
-  command.resolve(payload);
-  pumpAdminSessionQueue(session);
-  processTransferQueue();
-}
-
-function handleAdminSessionPayload(session: AdminSessionState, payload: SessionPayload): void {
-  if (payload.type === 'ready') {
-    if (payload.ok) {
-      if (!readyPayloadMatchesConnection(payload, session.connectionId, session.rawKey)) {
-        destroyAdminMtpSession(
-          'The protected helper opened a different phone connection than the one requested.',
-          true
-        );
-        return;
-      }
-      session.isReady = true;
-      if (session.readyTimer) {
-        clearTimeout(session.readyTimer);
-        session.readyTimer = null;
-      }
-      const resolveReady = session.readyResolve;
-      session.readyResolve = null;
-      session.readyReject = null;
-      resolveReady?.();
-      appendLog(payload.message || 'admin MTP session opened');
-    } else {
-      destroyAdminMtpSession(payload.message || 'Unable to open the admin MTP session.');
-    }
-    return;
-  }
-
-  if (
-    (payload.type === 'download' || payload.type === 'upload' || payload.type === 'list') &&
-    session.activeCommand
-  ) {
-    const command = session.activeCommand;
-    if (payload.requestId === command.id) {
-      command.onEvent?.(payload);
-      if (payload.event === 'progress') {
-        armCommandTimer(command, () => {
-          destroyAdminMtpSession(`Admin MTP command timed out after ${command.timeoutMs}ms.`, true);
-        });
-      }
-      return;
-    }
-  }
-
-  if (payload.type === 'response') {
-    finishAdminSessionCommand(session, payload);
-    return;
-  }
-
-  if (payload.type !== 'bye') {
-    appendLog(`admin session payload ignored: ${JSON.stringify(payload)}`);
-  }
-}
-
-function pollAdminSessionOutput(session: AdminSessionState): void {
-  if (adminSession !== session) {
-    return;
-  }
-
-  let fileDescriptor: number | null = null;
-  let chunk: Buffer;
-  try {
-    fileDescriptor = openSync(session.outputPath, 'r');
-    const size = fstatSync(fileDescriptor).size;
-    if (size <= session.outputOffset) {
-      closeSync(fileDescriptor);
-      return;
-    }
-    const bytesToRead = Math.min(size - session.outputOffset, 4 * 1024 * 1024);
-    chunk = Buffer.allocUnsafe(bytesToRead);
-    const bytesRead = readSync(
-      fileDescriptor,
-      chunk,
-      0,
-      bytesToRead,
-      session.outputOffset
-    );
-    chunk = chunk.subarray(0, bytesRead);
-    session.outputOffset += bytesRead;
-    closeSync(fileDescriptor);
-    fileDescriptor = null;
-  } catch {
-    if (fileDescriptor !== null) {
-      closeSync(fileDescriptor);
-    }
-    return;
-  }
-
-  if (!chunk.length) {
-    return;
-  }
-
-  session.outputBuffer += chunk.toString('utf8');
-  const lines = session.outputBuffer.split('\n');
-  session.outputBuffer = lines.pop() ?? '';
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) {
-      continue;
-    }
-    const exitMatch = trimmed.match(/^__MTP_ADMIN_SESSION_EXIT:(\d+)$/);
-    if (exitMatch) {
-      destroyAdminMtpSession(`Admin MTP session exited with code ${exitMatch[1]}.`);
-      return;
-    }
-    if (!trimmed.startsWith('{')) {
-      appendAdminSessionText(session, trimmed);
-      continue;
-    }
-
-    try {
-      handleAdminSessionPayload(session, JSON.parse(trimmed) as SessionPayload);
-    } catch (error) {
-      appendLog(`admin session JSON parse failed: ${String(error)} line=${trimmed}`);
-    }
-  }
-}
-
-function pumpAdminSessionQueue(session: AdminSessionState): void {
-  if (session.activeCommand || !session.input || session.input.destroyed) {
-    return;
-  }
-
-  const command = session.queue.shift();
-  if (!command) {
-    return;
-  }
-
-  session.activeCommand = command;
-  armCommandTimer(command, () => {
-    destroyAdminMtpSession(`Admin MTP command timed out after ${command.timeoutMs}ms.`, true);
-  });
-  session.input.write(command.line);
-}
-
-function detachAdminMtpSessionForRelaunch(reason: string): boolean {
-  const session = adminSession;
-  if (!session || !session.isReady || session.activeCommand || session.queue.length > 0 || activeJobId !== null) {
-    return false;
-  }
-
-  const expiresAt = Date.now() + ADMIN_SESSION_RECONNECT_TTL_MS;
-  try {
-    writeFileSync(session.expirePath, `${Math.floor(expiresAt / 1000)}\n`, 'utf8');
-    chmodSync(session.expirePath, 0o600);
-    writeAdminSessionManifest(session, expiresAt);
-  } catch (error) {
-    appendLog(`unable to detach protected MTP session for relaunch: ${error instanceof Error ? error.message : String(error)}`);
-    removeAdminSessionManifest();
-    return false;
-  }
-
-  appendLog(`admin mtp session detached for relaunch: ${reason}`);
-  adminSession = null;
-  if (session.readyTimer) {
-    clearTimeout(session.readyTimer);
-  }
-  if (session.pollTimer) {
-    clearInterval(session.pollTimer);
-  }
-  clearAdminReady(session);
-  rejectAdminSessionCommands(session, new Error(reason));
-  if (session.input && !session.input.destroyed) {
-    session.input.end();
-  }
-  return true;
-}
-
-function destroyAdminMtpSession(reason: string, forceProcessStop = false): void {
-  const session = adminSession;
-  if (!session) {
-    removeAdminSessionManifest();
-    return;
-  }
-
-  appendLog(`admin mtp session closing: ${reason}`);
-  removeAdminSessionManifest();
-  adminSession = null;
-  if (!sessionProcess) {
-    rawDevicesMissingSince = null;
-  }
-
-  if (session.readyTimer) {
-    clearTimeout(session.readyTimer);
-  }
-  if (session.pollTimer) {
-    clearInterval(session.pollTimer);
-  }
-  clearAdminReady(session, new Error(reason));
-  rejectAdminSessionCommands(session, new Error(reason));
-
-  if (session.input && !session.input.destroyed) {
-    session.input.write('quit\n');
-    session.input.end();
-  }
-
-  if (forceProcessStop) {
-    stopAdminSessionProcess(session, reason);
-  }
-
-  // The root-owned runner removes its private runtime directory after the helper exits.
-}
-
-async function startAdminMtpSession(deviceIndex: number, rawDevice: RawDevice): Promise<void> {
-  deviceIndex = rawDevice.index;
-  const helperPath = await ensureBridge();
-  const rawKey = rawDeviceKey(rawDevice);
-  const connectionId = rawDeviceConnectionId(rawDevice);
-  const deviceIdentityKey = rawDeviceIdentityKey(rawDevice);
-  const usbSessionId = rawDeviceUsbSessionId(rawDevice);
-
-  if (
-    adminSession &&
-    adminSession.connectionId === connectionId
-  ) {
-    adminSession.deviceIndex = rawDevice.index;
-    adminSession.rawKey = rawKey;
-    await adminSession.ready;
-    return;
-  }
-
-  if (await attachDetachedAdminMtpSession(deviceIndex, rawDevice)) {
-    await adminSession?.ready;
-    return;
-  }
-
-  if (adminSession) {
-    destroyAdminMtpSession('Restarting admin MTP session for selected device.');
-  }
-
-  const stagingRoot = mkdtempSync(join(tmpdir(), 'androidFileTransferForMacOS-admin-session-'));
-  const stagedBinDir = join(stagingRoot, 'resources', 'bin');
-  const stagedLibDir = join(stagingRoot, 'resources', 'lib');
-  const stagedHelper = join(stagedBinDir, 'mtp-json');
-  const stagedRunner = join(stagingRoot, 'run-session.sh');
-
-  mkdirSync(stagedBinDir, { recursive: true });
-  mkdirSync(stagedLibDir, { recursive: true });
-  copyFileSync(helperPath, stagedHelper);
-  const helperLibDir = resolve(dirname(helperPath), '..', 'lib');
-  if (existsSync(helperLibDir)) {
-    cpSync(helperLibDir, stagedLibDir, { recursive: true });
-  } else {
-    appendLog(`admin mtp session library directory missing: ${helperLibDir}`);
-  }
-  chmodSync(stagedHelper, 0o755);
-  writeFileSync(
-    stagedRunner,
-    `#!/bin/sh
-set -u
-helper="$1"
-device_index="$2"
-input_path="$3"
-output_path="$4"
-stop_path="$5"
-expire_path="$6"
-root_stage="$7"
-owner_uid="$8"
-owner_gid="$9"
-child_pid=""
-open_ready_seen=0
-
-cleanup_root_stage() {
-  sleep 5
-  rm -rf "$root_stage"
-}
-
-ready_seen() {
-  grep -q '"type":"ready","ok":true' "$output_path" 2>/dev/null
-}
-
-kill_child() {
-  if [ -n "$child_pid" ] && kill -0 "$child_pid" 2>/dev/null; then
-    kill -TERM "$child_pid" 2>/dev/null || true
-    sleep 1
-    kill -KILL "$child_pid" 2>/dev/null || true
-  fi
-}
-
-term_handler() {
-  trap - TERM INT HUP
-  kill_child
-  printf "\\n__MTP_ADMIN_SESSION_EXIT:143\\n" >> "$output_path"
-  exit 143
-}
-
-trap term_handler TERM INT HUP
-trap cleanup_root_stage EXIT
-exec 3<>"$input_path"
-
-attempt=1
-while [ "$attempt" -le ${ADMIN_MTP_OPEN_MAX_ATTEMPTS} ]; do
-  if [ "$attempt" -gt 1 ]; then
-    printf "\\n__MTP_ADMIN_OPEN_RETRY:%s\\n" "$attempt" >> "$output_path"
-    sleep 2
-  fi
-
-  open_ready_seen=0
-  /usr/bin/env -i \
-    HOME=/var/empty \
-    PATH=/usr/bin:/bin:/usr/sbin:/sbin \
-    MAC_ANDROID_TRANSFER_ADMIN_RETRY_READY=1 \
-    MAC_ANDROID_TRANSFER_REQUIRE_PRIVILEGE_DROP=1 \
-    MAC_ANDROID_TRANSFER_OWNER_UID="$owner_uid" \
-    MAC_ANDROID_TRANSFER_OWNER_GID="$owner_gid" \
-    "$helper" session "$device_index" < "$input_path" >> "$output_path" 2>&1 &
-  child_pid="$!"
-  attempt_started_at="$(date +%s)"
-
-  while kill -0 "$child_pid" 2>/dev/null; do
-    now="$(date +%s)"
-    if [ "$open_ready_seen" -eq 0 ] && ready_seen; then
-      open_ready_seen=1
-    fi
-
-    if [ -s "$stop_path" ]; then
-      kill_child
-      wait "$child_pid" 2>/dev/null || true
-      code=143
-      printf "\\n__MTP_ADMIN_SESSION_EXIT:%s\\n" "$code" >> "$output_path"
-      exit "$code"
-    fi
-
-    if [ -s "$expire_path" ]; then
-      expire_at="$(cat "$expire_path" 2>/dev/null || echo 0)"
-      case "$expire_at" in
-        ''|*[!0-9]*) expire_at=0 ;;
-      esac
-      if [ "$expire_at" -gt 0 ] && [ "$now" -ge "$expire_at" ]; then
-        kill_child
-        wait "$child_pid" 2>/dev/null || true
-        code=143
-        printf "\\n__MTP_ADMIN_SESSION_EXIT:%s\\n" "$code" >> "$output_path"
-        exit "$code"
-      fi
-    fi
-
-    if [ "$open_ready_seen" -eq 0 ] && [ $((now - attempt_started_at)) -ge ${ADMIN_MTP_OPEN_ATTEMPT_TIMEOUT_SECONDS} ]; then
-      printf "\\n__MTP_ADMIN_OPEN_ATTEMPT_TIMEOUT:%s\\n" "$attempt" >> "$output_path"
-      kill_child
-      break
-    fi
-
-    sleep 1
-  done
-
-  wait "$child_pid" 2>/dev/null
-  code="$?"
-  child_pid=""
-
-  if [ "$open_ready_seen" -eq 1 ] || [ "$code" -eq 0 ]; then
-    printf "\\n__MTP_ADMIN_SESSION_EXIT:%s\\n" "$code" >> "$output_path"
-    exit "$code"
-  fi
-
-  if [ "$attempt" -ge ${ADMIN_MTP_OPEN_MAX_ATTEMPTS} ]; then
-    printf '{"type":"ready","ok":false,"state":"connect-error","message":"Phone USB was detected in File Transfer mode, but the MTP file session did not open. The OpenSession step failed after USB reset attempts, so this app never received the phone folder list. Keep the phone unlocked, tap Allow if asked, then switch USB mode away from File Transfer and back before trying Open files again."}\\n' >> "$output_path"
-    printf "\\n__MTP_ADMIN_SESSION_EXIT:%s\\n" "$code" >> "$output_path"
-    exit "$code"
-  fi
-
-  attempt=$((attempt + 1))
-done
-printf "\\n__MTP_ADMIN_SESSION_EXIT:1\\n" >> "$output_path"
-exit 1
-`,
-    'utf8'
-  );
-  chmodSync(stagedRunner, 0o755);
-
-  const uid = process.getuid?.() ?? 0;
-  const gid = process.getgid?.() ?? 0;
-  const privilegedStageRoot = `/private/var/tmp/androidFileTransferForMacOS-protected-${randomUUID()}`;
-  const privilegedBinDir = join(privilegedStageRoot, 'resources', 'bin');
-  const privilegedLibDir = join(privilegedStageRoot, 'resources', 'lib');
-  const privilegedIpcDir = join(privilegedStageRoot, 'ipc');
-  const privilegedHelper = join(privilegedBinDir, 'mtp-json');
-  const privilegedRunner = join(privilegedStageRoot, 'run-session.sh');
-  const inputPath = join(privilegedIpcDir, 'stdin.fifo');
-  const outputPath = join(privilegedIpcDir, 'stdout.log');
-  const pidPath = join(privilegedIpcDir, 'session.pid');
-  const stopPath = join(privilegedIpcDir, 'stop-requested');
-  const expirePath = join(privilegedIpcDir, 'session-expire-at');
-  const stagedLibraries = readdirSync(stagedLibDir)
-    .filter((name) => name.endsWith('.dylib'))
-    .map((name) => ({
-      source: join(stagedLibDir, name),
-      target: join(privilegedLibDir, name)
-    }));
-  const privilegedFiles = [
-    { source: stagedHelper, target: privilegedHelper, mode: '755' },
-    ...stagedLibraries.map((library) => ({ ...library, mode: '755' })),
-    { source: stagedRunner, target: privilegedRunner, mode: '700' }
-  ];
-  const installAndVerifyCommands = privilegedFiles.flatMap((file) => {
-    const expectedHash = sha256File(file.source);
-    return [
-      `/usr/bin/install -o root -g wheel -m ${file.mode} ${shellQuote(file.source)} ${shellQuote(file.target)}`,
-      `test "$(/usr/bin/shasum -a 256 ${shellQuote(file.target)} | /usr/bin/awk '{print $1}')" = ${shellQuote(expectedHash)}`
-    ];
-  });
-  const shellCommand = [
-    'set -e',
-    `trap ${shellQuote(`/bin/rm -rf ${privilegedStageRoot}`)} 0 1 2 15`,
-    `/bin/rm -rf ${shellQuote(privilegedStageRoot)}`,
-    `/bin/mkdir -p ${shellQuote(privilegedBinDir)} ${shellQuote(privilegedLibDir)} ${shellQuote(privilegedIpcDir)}`,
-    `/bin/chmod 711 ${shellQuote(privilegedStageRoot)} ${shellQuote(privilegedIpcDir)}`,
-    `/bin/chmod 700 ${shellQuote(join(privilegedStageRoot, 'resources'))} ${shellQuote(privilegedBinDir)} ${shellQuote(privilegedLibDir)}`,
-    ...installAndVerifyCommands,
-    `/usr/bin/mkfifo ${shellQuote(inputPath)}`,
-    `/usr/bin/touch ${shellQuote(outputPath)} ${shellQuote(pidPath)} ${shellQuote(stopPath)} ${shellQuote(expirePath)}`,
-    `/usr/sbin/chown ${uid}:${gid} ${shellQuote(inputPath)} ${shellQuote(outputPath)} ${shellQuote(pidPath)} ${shellQuote(stopPath)} ${shellQuote(expirePath)}`,
-    `/bin/chmod 600 ${shellQuote(inputPath)} ${shellQuote(outputPath)} ${shellQuote(pidPath)} ${shellQuote(stopPath)} ${shellQuote(expirePath)}`,
-    `${shellQuote(privilegedRunner)} ${shellQuote(privilegedHelper)} ${shellQuote(String(deviceIndex))} ${shellQuote(inputPath)} ${shellQuote(outputPath)} ${shellQuote(stopPath)} ${shellQuote(expirePath)} ${shellQuote(privilegedStageRoot)} ${shellQuote(String(uid))} ${shellQuote(String(gid))} >/dev/null 2>&1 & printf "%s\\n" "$!" > ${shellQuote(pidPath)}`,
-    'trap - 0 1 2 15',
-    'exit 0'
-  ].join('; ');
-
-  appendLog(`admin mtp session starting for raw device ${rawKey} (${rawDevice.vendor} ${rawDevice.product})`);
-  const result = await runAppleScript(
-    `do shell script ${appleScriptString(shellCommand)} with administrator privileges with prompt ${appleScriptString(adminPrompt(rawDevice))}`,
-    180_000
-  );
-
-  if (result.error) {
-    const message = adminSessionStartMessage(result);
-    appendLog(`admin mtp session did not start: ${message}`);
-    rmSync(stagingRoot, { recursive: true, force: true });
-    throw new Error(message);
-  }
-
-  rmSync(stagingRoot, { recursive: true, force: true });
-
-  let readyResolve: (() => void) | null = null;
-  let readyReject: ((error: Error) => void) | null = null;
-  const ready = new Promise<void>((resolve, reject) => {
-    readyResolve = resolve;
-    readyReject = reject;
-  });
-
-  const session: AdminSessionState = {
-    deviceIndex,
-    connectionId,
-    rawKey,
-    deviceIdentityKey,
-    usbSessionId,
-    stageRoot: privilegedStageRoot,
-    stagedHelper: privilegedHelper,
-    runnerPath: privilegedRunner,
-    inputPath,
-    outputPath,
-    pidPath,
-    stopPath,
-    expirePath,
-    processPid: readPidFile(pidPath),
-    input: null,
-    outputOffset: 0,
-    outputBuffer: '',
-    stderrBuffer: '',
-    isReady: false,
-    ready,
-    readyResolve,
-    readyReject,
-    readyTimer: null,
-    pollTimer: null,
-    activeCommand: null,
-    queue: []
-  };
-
-  adminSession = session;
-  session.pollTimer = setInterval(() => pollAdminSessionOutput(session), 100);
-  session.readyTimer = setTimeout(() => {
-    destroyAdminMtpSession(`Admin MTP session open timed out after ${ADMIN_MTP_SESSION_OPEN_TIMEOUT_MS}ms.`, true);
-  }, ADMIN_MTP_SESSION_OPEN_TIMEOUT_MS);
-
-  session.input = createWriteStream(inputPath, { flags: 'w' });
-  session.input.on('error', (error) => {
-    if (adminSession === session) {
-      destroyAdminMtpSession(`Admin MTP input error: ${error.message}`, true);
-    }
-  });
-
-  try {
-    await session.ready;
-  } catch (error) {
-    if (adminSession === session) {
-      destroyAdminMtpSession(error instanceof Error ? error.message : String(error), true);
-    }
-    throw error;
-  }
-}
-
-async function adminFallbackIsAvailable(
-  deviceIndex: number,
-  expectedConnectionId?: string
-): Promise<boolean> {
-  if (
-    adminSession &&
-    (!expectedConnectionId || adminSession.connectionId === expectedConnectionId)
-  ) {
-    const visibleDevice = expectedConnectionId
-      ? rawDeviceForConnection(deviceIndex, expectedConnectionId)
-      : rawDeviceForConnection(deviceIndex);
-    if (visibleDevice) {
-      adminSession.deviceIndex = visibleDevice.index;
-      adminSession.rawKey = rawDeviceKey(visibleDevice);
-    }
-    await adminSession.ready;
-    return true;
-  }
-
-  if (lastRawDevices.length === 0) {
-    await refreshRawDevices();
-  }
-
-  const rawDevice = rawDeviceForConnection(deviceIndex, expectedConnectionId);
-  if (rawDevice && (await attachDetachedAdminMtpSession(deviceIndex, rawDevice))) {
-    await adminSession?.ready;
-    return true;
-  }
-
-  return false;
-}
-
-async function runAdminSessionCommand<T extends SessionPayload>(
-  deviceIndex: number,
-  deviceConnectionId: string,
-  commandName: string,
-  args: string[],
-  timeoutMs: number,
-  onEvent?: (payload: SessionPayload) => void
-): Promise<T> {
-  if (lastRawDevices.length === 0) {
-    await refreshRawDevices();
-  }
-  const rawDevice = rawDeviceForConnection(deviceIndex, deviceConnectionId);
-  if (!rawDevice) {
-    throw new Error('No raw MTP device is available for the admin session.');
-  }
-
-  await startAdminMtpSession(rawDevice.index, rawDevice);
-  const session = adminSession;
-  if (!session) {
-    throw new Error('Admin MTP session was not available after startup.');
-  }
-
-  if (args.some((arg) => /[\r\n]/.test(arg))) {
-    throw new Error('MTP command arguments cannot contain newlines.');
-  }
-
-  return new Promise<T>((resolve, reject) => {
-    const id = randomUUID();
-    const line = [commandName, id, ...args].join(' ') + '\n';
-    session.queue.push({
-      id,
-      name: commandName,
-      line,
-      timeoutMs,
-      resolve: (payload) => resolve(payload as T),
-      reject,
-      onEvent
-    });
-    pumpAdminSessionQueue(session);
-  });
-}
-
-async function confirmAdminRecovery(rawDevice: RawDevice): Promise<boolean> {
-  const detail = [
-    `Android File Transfer for macOS can see ${rawDevice.vendor || rawDevice.product || 'your phone'}, but macOS blocked the normal USB file connection.`,
-    'To open the files, the app needs to start one protected phone-file session.',
-    'Choose Continue, then enter the same password you use to unlock this Mac.',
-    'The next macOS password window may say "osascript wants to make changes." That is the macOS password prompt for this protected file session.',
-    'Choose Cancel if you did not ask to open phone files.',
-    'Opening files does not delete, move, or change anything. A source file is deleted only if you later choose Move and its destination copy is verified.'
-  ].join('\n\n');
-
-  const result = mainWindow
-    ? await dialog.showMessageBox(mainWindow, {
-        type: 'question',
-        buttons: ['Continue', 'Cancel'],
-        defaultId: 0,
-        cancelId: 1,
-        title: 'Why macOS asks for your password',
-        message: 'Why macOS asks for your password',
-        detail
-      })
-    : await dialog.showMessageBox({
-        type: 'question',
-        buttons: ['Continue', 'Cancel'],
-        defaultId: 0,
-        cancelId: 1,
-        title: 'Why macOS asks for your password',
-        message: 'Why macOS asks for your password',
-        detail
-      });
-
-  return result.response === 0;
-}
-
-async function recoverWithAdmin(): Promise<AdminRecoveryResult> {
-  const logPath = getLogPath();
-  const helperPath = getBridgePath();
-
-  try {
-    await ensureBridge();
-  } catch (error) {
-    const missing = missingBridgeStatus(error);
-    return {
-      ok: false,
-      state: missing.state,
-      message: missing.message,
-      helperPath,
-      logPath,
-      stderr: missing.stderr
-    };
-  }
-
-  const status = await getStatus();
-  const rawDevice = status.rawDevices[0];
-  const rawMtpDeviceVisible = rawDevice?.connectionMode === 'mtp';
-  if (!rawDevice || (status.state !== 'connected' && !rawMtpDeviceVisible)) {
-    return {
-      ok: false,
-      state: status.state,
-      message: 'Open files was not started because no MTP phone is visible.',
-      helperPath,
-      logPath,
-      stderr: status.stderr
-    };
-  }
-
-  if (sessionProcess) {
-    destroyMtpSession('Starting protected MTP session.');
-  }
-
-  try {
-    const reattached = await attachDetachedAdminMtpSession(rawDevice.index, rawDevice);
-    if (!reattached) {
-      const confirmed = await confirmAdminRecovery(rawDevice);
-      if (!confirmed) {
-        return {
-          ok: false,
-          state: 'connected',
-          message: 'Open files was canceled. Nothing was changed.',
-          helperPath,
-          logPath,
-          rawDevice
-        };
-      }
-    }
-
-    await startAdminMtpSession(rawDevice.index, rawDevice);
-    const inventory = await runAdminSessionCommand<InventoryResult & SessionPayload>(
-      rawDevice.index,
-      rawDeviceConnectionId(rawDevice),
-      'inventory',
-      [],
-      60_000
-    );
-
-    if (!inventory.ok) {
-      return {
-        ok: false,
-        state: inventory.state,
-        message:
-          inventory.message ||
-          'Open files started, but the phone still did not return its storage list.',
-        helperPath,
-        logPath,
-        stderr: adminSession?.stderrBuffer || undefined,
-        rawDevice
-      };
-    }
-
-    lastSessionStderr = '';
-
-    return {
-      ok: true,
-      state: 'connected',
-      message: reattached
-        ? 'Reconnected to the open phone-file session. You can browse and copy files now.'
-        : 'Phone files are open. You can browse and copy files now.',
-      helperPath,
-      logPath,
-      inventory: {
-        ok: true,
-        state: 'connected',
-        message: inventory.message || 'Inventory scan completed.',
-        devices: inventory.devices.map((device) => ({
-          ...device,
-          index: rawDevice.index,
-          connectionId: rawDeviceConnectionId(rawDevice),
-          protectedAccess: true
-        })),
-        helperPath,
-        logPath,
-        protectedAccess: true,
-        stderr: adminSession?.stderrBuffer || undefined
-      },
-      rawDevice
-    };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    appendLog(`admin recovery failed: ${message}`);
-    const canceled = message.toLowerCase().includes('was canceled');
-    return {
-      ok: false,
-      state: canceled ? 'connected' : 'connect-error',
-      message:
-        message.startsWith('Open files') || message.startsWith('The Mac password prompt timed out')
-          ? message
-          : `Open files failed. ${message}`,
-      helperPath,
-      logPath,
-      stderr: adminSession?.stderrBuffer || undefined,
-      rawDevice
-    };
-  }
-}
-
 function getPrimaryWindowBounds(): { x: number; y: number; width: number; height: number } {
   const { workArea } = screen.getPrimaryDisplay();
   const width = Math.min(1220, Math.max(980, workArea.width - 96));
@@ -4355,7 +4712,7 @@ function buildApplicationMenu(): void {
       label: 'File',
       submenu: [
         {
-          label: 'Open Phone Files...',
+          label: 'Retry Phone Connection...',
           click: () => sendAppMenuCommand('open-files')
         },
         {
@@ -4393,6 +4750,16 @@ function buildApplicationMenu(): void {
         {
           label: 'Paste File Selection',
           click: () => sendAppMenuCommand('paste-selection')
+        },
+        { type: 'separator' },
+        {
+          label: 'Rename Selected Item',
+          accelerator: 'CommandOrControl+D',
+          click: () => sendAppMenuCommand('rename-selected-item')
+        },
+        {
+          label: 'Delete Selected Items...',
+          click: () => sendAppMenuCommand('delete-selected-items')
         },
         { type: 'separator' },
         {
@@ -4464,6 +4831,11 @@ function buildApplicationMenu(): void {
       label: 'Help',
       submenu: [
         {
+          label: 'Check for Updates...',
+          click: () => sendAppMenuCommand('check-for-updates')
+        },
+        { type: 'separator' },
+        {
           label: 'Open Log',
           click: () => sendAppMenuCommand('open-log')
         }
@@ -4476,7 +4848,21 @@ function buildApplicationMenu(): void {
 
 app.whenReady().then(() => {
   removeLegacyPrecopyDirectory();
+  cleanupLegacyPrivilegedSession();
   appendLog('app ready');
+
+  if (process.argv.includes('--file-promise-smoke')) {
+    if (!loadFilePromiseDragAddon()) {
+      console.error('PACKAGED_FILE_PROMISE_DRAG_UNAVAILABLE');
+      app.exit(1);
+      return;
+    }
+    appendLog('packaged file-promise drag smoke passed');
+    console.log('PACKAGED_FILE_PROMISE_DRAG_OK');
+    app.exit(0);
+    return;
+  }
+
   buildApplicationMenu();
 
   ipcMain.handle('mtp:getStatus', getStatus);
@@ -4486,6 +4872,7 @@ app.whenReady().then(() => {
     (_event, deviceIndex: number, deviceConnectionId: string, storageId: number, parentId: number) =>
       listFolder(deviceIndex, deviceConnectionId, storageId, parentId)
   );
+  ipcMain.handle('mtp:cancelConnectionAttempt', () => cancelConnectionAttempt());
   ipcMain.handle('mtp:cancelFolderListing', () => cancelFolderListing());
   ipcMain.handle('local:listDirectory', (_event, directoryPath?: string, showHiddenFiles?: boolean) =>
     listLocalDirectory(directoryPath, showHiddenFiles === true)
@@ -4496,6 +4883,15 @@ app.whenReady().then(() => {
   ipcMain.handle('local:ensureDirectory', (_event, directoryPath: string) =>
     ensureLocalDirectory(directoryPath)
   );
+  ipcMain.handle('local:createFolder', (_event, request: CreateLocalFolderRequest) =>
+    createLocalFolder(request)
+  );
+  ipcMain.handle('local:renameItem', (_event, request: RenameLocalItemRequest) =>
+    renameLocalItem(request)
+  );
+  ipcMain.handle('local:trashItems', (_event, request: TrashLocalItemsRequest) =>
+    trashLocalItems(request)
+  );
   ipcMain.handle('local:setModifiedTime', (_event, localPath: string, modified: number) =>
     setLocalModifiedTime(localPath, modified)
   );
@@ -4503,10 +4899,10 @@ app.whenReady().then(() => {
   ipcMain.handle('mtp:chooseDestination', chooseDestination);
   ipcMain.handle('mtp:getDesktopDestination', getDesktopDestination);
   ipcMain.handle('mtp:startDownloads', (_event, requests: TransferRequest[]) =>
-    enqueueDownloads(requests)
+    queueDownloads(requests)
   );
   ipcMain.handle('mtp:startUploads', (_event, requests: UploadRequest[]) =>
-    enqueueUploads(requests)
+    queueUploads(requests)
   );
   ipcMain.handle('mtp:startMoveDownloads', (_event, requests: TransferRequest[]) =>
     enqueueMoveDownloads(requests)
@@ -4517,6 +4913,12 @@ app.whenReady().then(() => {
   ipcMain.handle('mtp:createFolder', (_event, request: CreateFolderRequest) =>
     createPhoneFolder(request)
   );
+  ipcMain.handle('mtp:renamePhoneItem', (_event, request: RenamePhoneItemRequest) =>
+    renamePhoneItem(request)
+  );
+  ipcMain.handle('mtp:deletePhoneItems', (_event, request: DeletePhoneItemsRequest) =>
+    deletePhoneItems(request)
+  );
   ipcMain.on('mtp:startPhoneFilePromiseDrag', (_event, request: PhoneFilePromiseDragRequest) =>
     startPhoneFilePromiseDrag(request)
   );
@@ -4526,11 +4928,16 @@ app.whenReady().then(() => {
   ipcMain.handle('mtp:revealInFinder', async (_event, filePath: string) => {
     shell.showItemInFolder(filePath);
   });
-  ipcMain.handle('mtp:recoverWithAdmin', recoverWithAdmin);
   ipcMain.handle('mtp:openLog', async () => {
     await shell.openPath(getLogPath());
   });
   ipcMain.handle('mtp:copyDiagnostics', copyDiagnostics);
+  ipcMain.handle('app:checkForUpdates', (_event, interactive?: boolean) =>
+    checkForAppUpdates(interactive === true)
+  );
+  ipcMain.handle('app:openUpdateRelease', (_event, releaseTag: string) =>
+    openUpdateRelease(releaseTag)
+  );
 
   showMainWindow();
 
@@ -4552,10 +4959,5 @@ app.on('before-quit', () => {
   }
   if (sessionProcess) {
     destroyMtpSession('App is quitting.');
-  }
-  if (adminSession) {
-    if (!detachAdminMtpSessionForRelaunch('App is quitting.')) {
-      destroyAdminMtpSession('App is quitting.');
-    }
   }
 });

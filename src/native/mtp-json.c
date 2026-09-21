@@ -1,13 +1,13 @@
 #include <errno.h>
-#include <grp.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #endif
 #include <libusb.h>
 #include <libmtp.h>
-#include <pwd.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,6 +45,14 @@ typedef struct {
   int needs_device_access_entitlement;
   int connection_mode_is_mtp;
 } android_usb_fallback_device_t;
+
+typedef struct {
+  uint64_t device;
+  uint64_t inode;
+  uint64_t size;
+  double modified_ms;
+  double changed_ms;
+} local_source_identity_t;
 
 #ifdef __APPLE__
 static int iokit_metadata_for_raw_device(uint16_t vendor_id,
@@ -126,16 +134,11 @@ static const char *detect_error_message(LIBMTP_error_number_t err) {
 }
 
 static const char *blocked_normal_access_message(void) {
-  return "Phone is visible in File Transfer mode, but its folders are not open yet. Use Open files to start one protected phone-file session.";
-}
-
-static int defer_session_open_failure_for_admin_retry(void) {
-  const char *value = getenv("MAC_ANDROID_TRANSFER_ADMIN_RETRY_READY");
-  return value != NULL && strcmp(value, "1") == 0;
+  return "The phone is visible in File Transfer mode, but it did not answer the MTP session request. The app will try again automatically.";
 }
 
 static const char *empty_storage_root_message(void) {
-  return "The phone did not return any folders for Internal storage. Keep the phone unlocked, tap Allow if Android asks, then press Retry.";
+  return "The phone did not return any folders for Internal storage. Keep the phone unlocked and tap Allow if Android asks; the app will keep checking automatically.";
 }
 
 static const char *first_mtp_error_text(LIBMTP_mtpdevice_t *device) {
@@ -918,6 +921,163 @@ static int parse_u32(const char *value, uint32_t *out) {
   return 1;
 }
 
+static int parse_u64(const char *value, uint64_t *out) {
+  if (value == NULL || *value == '\0') {
+    return 0;
+  }
+
+  char *endptr = NULL;
+  errno = 0;
+  unsigned long long parsed = strtoull(value, &endptr, 10);
+  if (errno != 0 || endptr == value || *endptr != '\0') {
+    return 0;
+  }
+
+  *out = (uint64_t)parsed;
+  return (unsigned long long)*out == parsed;
+}
+
+static int parse_finite_double(const char *value, double *out) {
+  if (value == NULL || *value == '\0') {
+    return 0;
+  }
+
+  char *endptr = NULL;
+  errno = 0;
+  double parsed = strtod(value, &endptr);
+  if (errno != 0 || endptr == value || *endptr != '\0' || !isfinite(parsed)) {
+    return 0;
+  }
+  *out = parsed;
+  return 1;
+}
+
+static int parse_optional_u64(const char *value, uint64_t *out, int *available) {
+  if (value != NULL && strcmp(value, "-") == 0) {
+    *out = 0;
+    *available = 0;
+    return 1;
+  }
+  if (!parse_u64(value, out)) {
+    return 0;
+  }
+  *available = 1;
+  return 1;
+}
+
+static int hex_value(char value) {
+  if (value >= '0' && value <= '9') {
+    return value - '0';
+  }
+  if (value >= 'a' && value <= 'f') {
+    return value - 'a' + 10;
+  }
+  if (value >= 'A' && value <= 'F') {
+    return value - 'A' + 10;
+  }
+  return -1;
+}
+
+static int valid_utf8(const unsigned char *value, size_t length) {
+  size_t index = 0;
+  while (index < length) {
+    unsigned char first = value[index++];
+    if (first <= 0x7f) {
+      continue;
+    }
+
+    size_t continuation_count = 0;
+    unsigned char minimum_second = 0x80;
+    unsigned char maximum_second = 0xbf;
+    if (first >= 0xc2 && first <= 0xdf) {
+      continuation_count = 1;
+    } else if (first >= 0xe0 && first <= 0xef) {
+      continuation_count = 2;
+      if (first == 0xe0) {
+        minimum_second = 0xa0;
+      } else if (first == 0xed) {
+        maximum_second = 0x9f;
+      }
+    } else if (first >= 0xf0 && first <= 0xf4) {
+      continuation_count = 3;
+      if (first == 0xf0) {
+        minimum_second = 0x90;
+      } else if (first == 0xf4) {
+        maximum_second = 0x8f;
+      }
+    } else {
+      return 0;
+    }
+
+    if (index + continuation_count > length ||
+        value[index] < minimum_second ||
+        value[index] > maximum_second) {
+      return 0;
+    }
+    index++;
+    for (size_t offset = 1; offset < continuation_count; offset++, index++) {
+      if (value[index] < 0x80 || value[index] > 0xbf) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
+static int valid_phone_item_name(const char *name, size_t length) {
+  if (name == NULL || length == 0 || length > 255 ||
+      (length == 1 && name[0] == '.') ||
+      (length == 2 && name[0] == '.' && name[1] == '.')) {
+    return 0;
+  }
+
+  for (size_t index = 0; index < length; index++) {
+    unsigned char value = (unsigned char)name[index];
+    if (value == 0 || value < 0x20 || value == 0x7f ||
+        value == '/' || value == '\\' || value == ':' || value == '*' ||
+        value == '?' || value == '"' || value == '<' || value == '>' || value == '|') {
+      return 0;
+    }
+  }
+  return valid_utf8((const unsigned char *)name, length);
+}
+
+static int decode_phone_item_name(const char *encoded, int validate_for_write, char **out) {
+  if (encoded == NULL || out == NULL) {
+    return 0;
+  }
+  size_t encoded_length = strlen(encoded);
+  if (encoded_length == 0 || encoded_length > 510 || encoded_length % 2 != 0) {
+    return 0;
+  }
+
+  size_t decoded_length = encoded_length / 2;
+  char *decoded = malloc(decoded_length + 1);
+  if (decoded == NULL) {
+    return 0;
+  }
+  for (size_t index = 0; index < decoded_length; index++) {
+    int high = hex_value(encoded[index * 2]);
+    int low = hex_value(encoded[index * 2 + 1]);
+    if (high < 0 || low < 0) {
+      free(decoded);
+      return 0;
+    }
+    decoded[index] = (char)((high << 4) | low);
+  }
+  decoded[decoded_length] = '\0';
+  if ((validate_for_write && !valid_phone_item_name(decoded, decoded_length)) ||
+      (!validate_for_write &&
+       (decoded_length == 0 || decoded_length > 255 ||
+        memchr(decoded, '\0', decoded_length) != NULL ||
+        !valid_utf8((const unsigned char *)decoded, decoded_length)))) {
+    free(decoded);
+    return 0;
+  }
+  *out = decoded;
+  return 1;
+}
+
 static int parse_nonnegative_int(const char *value, int *out) {
   if (value == NULL || *value == '\0') {
     return 0;
@@ -930,91 +1090,6 @@ static int parse_nonnegative_int(const char *value, int *out) {
   }
   *out = (int)parsed;
   return 1;
-}
-
-static int parse_owner_id_env(const char *name, unsigned long *out) {
-  const char *value = getenv(name);
-  if (value == NULL || *value == '\0') {
-    return 0;
-  }
-
-  char *endptr = NULL;
-  errno = 0;
-  unsigned long parsed = strtoul(value, &endptr, 10);
-  if (errno != 0 || endptr == value || *endptr != '\0') {
-    return 0;
-  }
-
-  *out = parsed;
-  return 1;
-}
-
-static int drop_protected_session_privileges(void) {
-  const char *required = getenv("MAC_ANDROID_TRANSFER_REQUIRE_PRIVILEGE_DROP");
-  if (required == NULL || strcmp(required, "1") != 0) {
-    return 1;
-  }
-
-  unsigned long owner_uid_value = 0;
-  unsigned long owner_gid_value = 0;
-  if (!parse_owner_id_env("MAC_ANDROID_TRANSFER_OWNER_UID", &owner_uid_value) ||
-      !parse_owner_id_env("MAC_ANDROID_TRANSFER_OWNER_GID", &owner_gid_value)) {
-    fprintf(stderr, "protected session is missing the target user identity\n");
-    return 0;
-  }
-
-  uid_t owner_uid = (uid_t)owner_uid_value;
-  gid_t owner_gid = (gid_t)owner_gid_value;
-  if ((unsigned long)owner_uid != owner_uid_value || (unsigned long)owner_gid != owner_gid_value) {
-    fprintf(stderr, "protected session target user identity is out of range\n");
-    return 0;
-  }
-
-  if (geteuid() != 0) {
-    if (geteuid() == owner_uid && getegid() == owner_gid) {
-      return 1;
-    }
-    fprintf(stderr, "protected session did not start with the required USB privilege\n");
-    return 0;
-  }
-
-  struct passwd *owner = getpwuid(owner_uid);
-  if (owner == NULL || owner->pw_name == NULL || *owner->pw_name == '\0') {
-    fprintf(stderr, "protected session could not resolve the target Mac user\n");
-    return 0;
-  }
-  if (initgroups(owner->pw_name, owner_gid) != 0 || setgid(owner_gid) != 0 || setuid(owner_uid) != 0) {
-    fprintf(stderr, "protected session could not drop USB startup privilege: %s\n", strerror(errno));
-    return 0;
-  }
-  if (geteuid() != owner_uid || getegid() != owner_gid) {
-    fprintf(stderr, "protected session privilege drop did not take effect\n");
-    return 0;
-  }
-
-  umask(022);
-  return 1;
-}
-
-static void restore_download_owner(const char *destination) {
-  unsigned long owner_uid = 0;
-  unsigned long owner_gid = 0;
-
-  if (destination == NULL || *destination == '\0') {
-    return;
-  }
-  if (!parse_owner_id_env("MAC_ANDROID_TRANSFER_OWNER_UID", &owner_uid) ||
-      !parse_owner_id_env("MAC_ANDROID_TRANSFER_OWNER_GID", &owner_gid)) {
-    return;
-  }
-
-  if ((geteuid() != (uid_t)owner_uid || getegid() != (gid_t)owner_gid) &&
-      chown(destination, (uid_t)owner_uid, (gid_t)owner_gid) != 0) {
-    fprintf(stderr, "warning: unable to restore owner on downloaded file %s: %s\n", destination, strerror(errno));
-  }
-  if (chmod(destination, 0644) != 0) {
-    fprintf(stderr, "warning: unable to restore permissions on downloaded file %s: %s\n", destination, strerror(errno));
-  }
 }
 
 static void print_session_error(const char *request_id, const char *message) {
@@ -1458,7 +1533,7 @@ static LIBMTP_file_t *ensure_session_fallback_files(LIBMTP_mtpdevice_t *device,
                                                     const char *request_id,
                                                     LIBMTP_file_t **fallback_files,
                                                     int *fallback_attempted) {
-  if (*fallback_attempted) {
+  if (*fallback_attempted && *fallback_files != NULL) {
     return *fallback_files;
   }
 
@@ -1472,6 +1547,9 @@ static LIBMTP_file_t *ensure_session_fallback_files(LIBMTP_mtpdevice_t *device,
       session_list_progress_callback,
       NULL);
   session_list_request_id = "";
+  if (*fallback_files == NULL) {
+    *fallback_attempted = 0;
+  }
   return *fallback_files;
 }
 
@@ -1599,24 +1677,68 @@ static int phone_file_conflict_status(LIBMTP_mtpdevice_t *device,
   return status;
 }
 
+static double source_stat_modified_ms(const struct stat *source_stat) {
+#ifdef __APPLE__
+  return (double)source_stat->st_mtimespec.tv_sec * 1000.0 +
+         (double)source_stat->st_mtimespec.tv_nsec / 1000000.0;
+#else
+  return (double)source_stat->st_mtim.tv_sec * 1000.0 +
+         (double)source_stat->st_mtim.tv_nsec / 1000000.0;
+#endif
+}
+
+static double source_stat_changed_ms(const struct stat *source_stat) {
+#ifdef __APPLE__
+  return (double)source_stat->st_ctimespec.tv_sec * 1000.0 +
+         (double)source_stat->st_ctimespec.tv_nsec / 1000000.0;
+#else
+  return (double)source_stat->st_ctim.tv_sec * 1000.0 +
+         (double)source_stat->st_ctim.tv_nsec / 1000000.0;
+#endif
+}
+
+static int source_stat_matches_identity(const struct stat *source_stat,
+                                        const local_source_identity_t *identity) {
+  return source_stat->st_size >= 0 &&
+         (uint64_t)source_stat->st_dev == identity->device &&
+         (uint64_t)source_stat->st_ino == identity->inode &&
+         (uint64_t)source_stat->st_size == identity->size &&
+         source_stat_modified_ms(source_stat) == identity->modified_ms &&
+         source_stat_changed_ms(source_stat) == identity->changed_ms;
+}
+
 static int send_file_to_device(LIBMTP_mtpdevice_t *device,
                                const char *source,
+                               const char *destination_name,
                                uint32_t storage_id,
                                uint32_t parent_id,
+                               const local_source_identity_t *expected_source_identity,
                                LIBMTP_progressfunc_t progress_func,
                                uint32_t *uploaded_object_id,
                                uint64_t *uploaded_size) {
+  const char *filename = destination_name != NULL ? destination_name : path_basename(source);
+  if (*filename == '\0') {
+    return -3;
+  }
+
+  int source_fd = open(source, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (source_fd < 0) {
+    return -1;
+  }
+
   struct stat source_stat;
-  if (lstat(source, &source_stat) != 0) {
+  if (fstat(source_fd, &source_stat) != 0) {
+    close(source_fd);
     return -1;
   }
   if (!S_ISREG(source_stat.st_mode)) {
+    close(source_fd);
     return -2;
   }
-
-  const char *filename = path_basename(source);
-  if (*filename == '\0') {
-    return -3;
+  if (expected_source_identity != NULL &&
+      !source_stat_matches_identity(&source_stat, expected_source_identity)) {
+    close(source_fd);
+    return -6;
   }
 
   int conflict_status = phone_file_conflict_status(
@@ -1625,26 +1747,41 @@ static int send_file_to_device(LIBMTP_mtpdevice_t *device,
       storage_id,
       parent_id);
   if (conflict_status == 2) {
+    close(source_fd);
     return -5;
   }
 
   LIBMTP_file_t *metadata = LIBMTP_new_file_t();
   if (metadata == NULL) {
+    close(source_fd);
     return -4;
   }
 
   metadata->filename = strdup(filename);
   if (metadata->filename == NULL) {
     LIBMTP_destroy_file_t(metadata);
+    close(source_fd);
     return -4;
   }
+
+  if (fstat(source_fd, &source_stat) != 0 ||
+      !S_ISREG(source_stat.st_mode) ||
+      (expected_source_identity != NULL &&
+       !source_stat_matches_identity(&source_stat, expected_source_identity))) {
+    LIBMTP_destroy_file_t(metadata);
+    close(source_fd);
+    return -6;
+  }
+
   metadata->filesize = (uint64_t)source_stat.st_size;
   metadata->parent_id = parent_id;
   metadata->storage_id = storage_id;
   metadata->modificationdate = source_stat.st_mtime;
   metadata->filetype = filetype_for_name(filename);
 
-  int result = LIBMTP_Send_File_From_File(device, source, metadata, progress_func, NULL);
+  int result = LIBMTP_Send_File_From_File_Descriptor(
+      device, source_fd, metadata, progress_func, NULL);
+  close(source_fd);
   if (result == 0) {
     if (uploaded_object_id != NULL) {
       *uploaded_object_id = metadata->item_id;
@@ -1779,7 +1916,6 @@ static int command_download(int argc, char **argv) {
     LIBMTP_Dump_Errorstack(device);
     LIBMTP_Clear_Errorstack(device);
   } else {
-    restore_download_owner(destination);
     printf("{\"event\":\"complete\",\"objectId\":%u,\"destination\":", object_id);
     json_string(destination);
     printf("}\n");
@@ -1910,8 +2046,10 @@ static int command_upload(int argc, char **argv) {
   int result = send_file_to_device(
       device,
       source,
+      path_basename(source),
       storage_id,
       parent_id,
+      NULL,
       progress_callback,
       &uploaded_object_id,
       &uploaded_size);
@@ -1952,7 +2090,14 @@ static void session_inventory(const char *request_id,
                               LIBMTP_raw_device_t *rawdevice,
                               LIBMTP_mtpdevice_t *device,
                               int *storage_mode) {
-  if (*storage_mode == 0) {
+  /*
+   * Samsung phones answer the first storage request with an empty list while
+   * the user is still deciding on the Android "Allow access" prompt. Only a
+   * real storage list may be cached for the rest of the session; the synthetic
+   * Phone storage placeholder (mode 2) must re-query the phone on every
+   * inventory so Retry can observe the newly granted storage.
+   */
+  if (*storage_mode != 1) {
     *storage_mode = prepare_device_storage(device, rawdevice);
   }
 
@@ -2005,7 +2150,7 @@ static void session_list(const char *request_id,
       printf(",\"ok\":false,\"state\":\"error\",\"message\":");
       json_string(fallback_error != NULL
                       ? fallback_error
-                      : "The phone did not return its file index. Reconnect the phone before trying again.");
+                      : "The phone file index could not be read. Retry will try again without reconnecting.");
       printf(",\"deviceIndex\":%d,\"storageId\":%u,\"parentId\":%u,\"objects\":[]}\n",
              device_index,
              storage_id,
@@ -2109,7 +2254,6 @@ static void session_download(const char *request_id,
     LIBMTP_Dump_Errorstack(device);
     LIBMTP_Clear_Errorstack(device);
   } else {
-    restore_download_owner(destination);
     printf(",\"ok\":true,\"event\":\"complete\",\"objectId\":%u,\"destination\":", object_id);
     json_string(destination);
     printf("}\n");
@@ -2121,11 +2265,15 @@ static void session_upload(const char *request_id,
                            LIBMTP_mtpdevice_t *device,
                            uint32_t storage_id,
                            uint32_t parent_id,
+                           const char *destination_name,
+                           const local_source_identity_t *source_identity,
                            const char *source) {
   printf("{\"type\":\"upload\",\"requestId\":");
   json_string(request_id);
   printf(",\"event\":\"started\",\"source\":");
   json_string(source);
+  printf(",\"destinationName\":");
+  json_string(destination_name);
   printf(",\"storageId\":%u,\"parentId\":%u}\n", storage_id, parent_id);
   fflush(stdout);
 
@@ -2137,8 +2285,10 @@ static void session_upload(const char *request_id,
   int result = send_file_to_device(
       device,
       source,
+      destination_name,
       storage_id,
       parent_id,
+      source_identity,
       session_progress_callback,
       &uploaded_object_id,
       &uploaded_size);
@@ -2159,6 +2309,8 @@ static void session_upload(const char *request_id,
       message = "The MTP helper could not prepare file metadata.";
     } else if (result == -5) {
       message = "A different item with the same name is already on the phone. Nothing was overwritten.";
+    } else if (result == -6) {
+      message = "The Mac file changed after it was queued, so it was not uploaded.";
     }
     printf(",\"ok\":false,\"event\":\"failed\",\"message\":");
     json_string(message);
@@ -2171,7 +2323,7 @@ static void session_upload(const char *request_id,
         uploaded_object_id,
         storage_id,
         parent_id,
-        path_basename(source),
+        destination_name,
         uploaded_size);
     printf(",\"ok\":true,\"event\":\"complete\",\"source\":");
     json_string(source);
@@ -2184,20 +2336,167 @@ static void session_upload(const char *request_id,
   fflush(stdout);
 }
 
-static void session_delete(const char *request_id,
-                           LIBMTP_mtpdevice_t *device,
-                           uint32_t object_id) {
-  int result = LIBMTP_Delete_Object(device, object_id);
+static void print_phone_mutation_failure(const char *request_id, const char *message) {
+  printf("{\"type\":\"response\",\"requestId\":");
+  json_string(request_id);
+  printf(",\"ok\":false,\"event\":\"failed\",\"message\":");
+  json_string(message);
+  printf("}\n");
+  fflush(stdout);
+}
+
+static LIBMTP_file_t *verified_phone_mutation_target(const char *request_id,
+                                                     LIBMTP_mtpdevice_t *device,
+                                                     uint32_t object_id,
+                                                     uint32_t storage_id,
+                                                     uint32_t parent_id,
+                                                     const char *kind,
+                                                     uint64_t expected_size,
+                                                     int expected_size_available,
+                                                     uint64_t expected_modified,
+                                                     int expected_modified_available,
+                                                     const char *expected_name) {
+  LIBMTP_file_t *metadata = LIBMTP_Get_Filemetadata(device, object_id);
+  if (metadata == NULL) {
+    const char *error = first_mtp_error_text(device);
+    print_phone_mutation_failure(
+        request_id,
+        error != NULL ? error : "The selected phone item no longer exists. Refresh the folder and try again.");
+    LIBMTP_Clear_Errorstack(device);
+    return NULL;
+  }
+
+  int expected_folder = strcmp(kind, "folder") == 0;
+  int actual_folder = metadata->filetype == LIBMTP_FILETYPE_FOLDER;
+  int storage_matches = storage_id == INFERRED_STORAGE_ID ||
+                        metadata->storage_id == 0 ||
+                        metadata->storage_id == storage_id;
+  int file_metadata_matches = expected_folder
+      ? !expected_size_available && !expected_modified_available
+      : expected_size_available &&
+        metadata->filesize == expected_size &&
+        (!expected_modified_available ||
+         (metadata->modificationdate >= 0 &&
+          (uint64_t)metadata->modificationdate == expected_modified));
+  if (metadata->item_id != object_id ||
+      metadata->parent_id != parent_id ||
+      !storage_matches ||
+      expected_folder != actual_folder ||
+      !file_metadata_matches ||
+      metadata->filename == NULL ||
+      strcmp(metadata->filename, expected_name) != 0) {
+    LIBMTP_destroy_file_t(metadata);
+    print_phone_mutation_failure(
+        request_id,
+        "The selected phone item changed since it was listed. Refresh the folder and try again.");
+    return NULL;
+  }
+  return metadata;
+}
+
+static void session_rename_item(const char *request_id,
+                                LIBMTP_mtpdevice_t *device,
+                                uint32_t object_id,
+                                uint32_t storage_id,
+                                uint32_t parent_id,
+                                const char *kind,
+                                uint64_t expected_size,
+                                int expected_size_available,
+                                uint64_t expected_modified,
+                                int expected_modified_available,
+                                const char *expected_name,
+                                const char *new_name) {
+  LIBMTP_file_t *metadata = verified_phone_mutation_target(
+      request_id,
+      device,
+      object_id,
+      storage_id,
+      parent_id,
+      kind,
+      expected_size,
+      expected_size_available,
+      expected_modified,
+      expected_modified_available,
+      expected_name);
+  if (metadata == NULL) {
+    return;
+  }
+
+  int result = LIBMTP_Set_File_Name(device, metadata, new_name);
+  if (result != 0) {
+    const char *error = first_mtp_error_text(device);
+    LIBMTP_destroy_file_t(metadata);
+    print_phone_mutation_failure(
+        request_id,
+        error != NULL ? error : "This phone did not accept the new name.");
+    LIBMTP_Dump_Errorstack(device);
+    LIBMTP_Clear_Errorstack(device);
+    return;
+  }
+
+  char *accepted_name = strdup(metadata->filename != NULL ? metadata->filename : new_name);
+  LIBMTP_destroy_file_t(metadata);
+  LIBMTP_file_t *updated = LIBMTP_Get_Filemetadata(device, object_id);
+  int verified = updated != NULL && updated->filename != NULL;
+  const char *actual_name = verified ? updated->filename : accepted_name;
 
   printf("{\"type\":\"response\",\"requestId\":");
   json_string(request_id);
+  printf(",\"ok\":true,\"event\":\"complete\",\"objectId\":%u,\"actualName\":", object_id);
+  json_string(actual_name != NULL ? actual_name : new_name);
+  printf(",\"verified\":%s}\n", verified ? "true" : "false");
+  fflush(stdout);
+
+  if (updated != NULL) {
+    LIBMTP_destroy_file_t(updated);
+  } else {
+    LIBMTP_Clear_Errorstack(device);
+  }
+  free(accepted_name);
+}
+
+static void session_delete_item(const char *request_id,
+                                LIBMTP_mtpdevice_t *device,
+                                uint32_t object_id,
+                                uint32_t storage_id,
+                                uint32_t parent_id,
+                                const char *kind,
+                                uint64_t expected_size,
+                                int expected_size_available,
+                                uint64_t expected_modified,
+                                int expected_modified_available,
+                                const char *expected_name) {
+  LIBMTP_file_t *metadata = verified_phone_mutation_target(
+      request_id,
+      device,
+      object_id,
+      storage_id,
+      parent_id,
+      kind,
+      expected_size,
+      expected_size_available,
+      expected_modified,
+      expected_modified_available,
+      expected_name);
+  if (metadata == NULL) {
+    return;
+  }
+  LIBMTP_destroy_file_t(metadata);
+
+  int result = LIBMTP_Delete_Object(device, object_id);
   if (result != 0) {
-    printf(",\"ok\":false,\"event\":\"failed\",\"message\":\"The copy is complete, but libmtp could not delete the source file from the phone.\"}\n");
+    const char *error = first_mtp_error_text(device);
+    print_phone_mutation_failure(
+        request_id,
+        error != NULL ? error : "The phone could not permanently delete this item.");
     LIBMTP_Dump_Errorstack(device);
     LIBMTP_Clear_Errorstack(device);
-  } else {
-    printf(",\"ok\":true,\"event\":\"complete\",\"objectId\":%u}\n", object_id);
+    return;
   }
+
+  printf("{\"type\":\"response\",\"requestId\":");
+  json_string(request_id);
+  printf(",\"ok\":true,\"event\":\"complete\",\"objectId\":%u}\n", object_id);
   fflush(stdout);
 }
 
@@ -2223,13 +2522,6 @@ static int command_session(int argc, char **argv) {
   LIBMTP_Init();
   err = LIBMTP_Detect_Raw_Devices(&rawdevices, &numrawdevices);
   if (err != LIBMTP_ERROR_NONE) {
-    if (defer_session_open_failure_for_admin_retry()) {
-      fprintf(stderr, "MTP session open failed before device open: %s\n", detect_error_message(err));
-      if (rawdevices != NULL) {
-        LIBMTP_FreeMemory(rawdevices);
-      }
-      return 1;
-    }
     printf("{\"type\":\"ready\",\"ok\":false,\"state\":");
     json_string(detect_error_state(err));
     printf(",\"message\":");
@@ -2249,22 +2541,9 @@ static int command_session(int argc, char **argv) {
 
   LIBMTP_mtpdevice_t *device = LIBMTP_Open_Raw_Device_Uncached(&rawdevices[device_index]);
   if (device == NULL) {
-    if (defer_session_open_failure_for_admin_retry()) {
-      fprintf(stderr, "MTP session open failed before ready: %s\n", blocked_normal_access_message());
-      LIBMTP_FreeMemory(rawdevices);
-      return 1;
-    }
     printf("{\"type\":\"ready\",\"ok\":false,\"state\":\"connect-error\",\"message\":");
     json_string(blocked_normal_access_message());
     printf("}\n");
-    LIBMTP_FreeMemory(rawdevices);
-    return 1;
-  }
-
-  if (!drop_protected_session_privileges()) {
-    printf("{\"type\":\"ready\",\"ok\":false,\"state\":\"error\",\"message\":\"Protected phone access opened USB but could not switch back to your Mac user safely.\"}\n");
-    fflush(stdout);
-    LIBMTP_Release_Device(device);
     LIBMTP_FreeMemory(rawdevices);
     return 1;
   }
@@ -2393,12 +2672,28 @@ static int command_session(int argc, char **argv) {
       uint32_t parent_id = 0;
       char *storage_token = next_token(&cursor);
       char *parent_token = next_token(&cursor);
+      char *destination_name_token = next_token(&cursor);
+      char *source_device_token = next_token(&cursor);
+      char *source_inode_token = next_token(&cursor);
+      char *source_size_token = next_token(&cursor);
+      char *source_modified_token = next_token(&cursor);
+      char *source_changed_token = next_token(&cursor);
       char *source = rest_token(&cursor);
+      char *destination_name = NULL;
+      local_source_identity_t source_identity;
+      memset(&source_identity, 0, sizeof(source_identity));
       if (!parse_u32(storage_token, &storage_id) ||
           !parse_u32(parent_token, &parent_id) ||
           storage_id == 0 ||
+          !decode_phone_item_name(destination_name_token, 1, &destination_name) ||
+          !parse_u64(source_device_token, &source_identity.device) ||
+          !parse_u64(source_inode_token, &source_identity.inode) ||
+          !parse_u64(source_size_token, &source_identity.size) ||
+          !parse_finite_double(source_modified_token, &source_identity.modified_ms) ||
+          !parse_finite_double(source_changed_token, &source_identity.changed_ms) ||
           source == NULL ||
           *source == '\0') {
+        free(destination_name);
         print_session_error(request_id, "Invalid upload command.");
         continue;
       }
@@ -2414,22 +2709,96 @@ static int command_session(int argc, char **argv) {
               request_id,
               "The phone did not expose one writable storage identifier, so this file was not uploaded.");
           LIBMTP_Clear_Errorstack(device);
+          free(destination_name);
           continue;
         }
       }
-      session_upload(request_id, device, storage_id, parent_id, source);
+      session_upload(
+          request_id,
+          device,
+          storage_id,
+          parent_id,
+          destination_name,
+          &source_identity,
+          source);
+      free(destination_name);
       clear_session_fallback_files(&fallback_files, &fallback_attempted);
       continue;
     }
 
-    if (strcmp(command, "delete") == 0) {
+    if (strcmp(command, "rename-item") == 0 || strcmp(command, "delete-item") == 0) {
       uint32_t object_id = 0;
+      uint32_t storage_id = 0;
+      uint32_t parent_id = 0;
       char *object_token = next_token(&cursor);
-      if (!parse_u32(object_token, &object_id) || object_id == 0) {
-        print_session_error(request_id, "Invalid delete command.");
+      char *storage_token = next_token(&cursor);
+      char *parent_token = next_token(&cursor);
+      char *kind = next_token(&cursor);
+      char *expected_size_token = next_token(&cursor);
+      char *expected_modified_token = next_token(&cursor);
+      char *expected_name_token = next_token(&cursor);
+      char *new_name_token = strcmp(command, "rename-item") == 0 ? next_token(&cursor) : NULL;
+      char *expected_name = NULL;
+      char *new_name = NULL;
+      uint64_t expected_size = 0;
+      uint64_t expected_modified = 0;
+      int expected_size_available = 0;
+      int expected_modified_available = 0;
+      int valid_kind = kind != NULL && (strcmp(kind, "file") == 0 || strcmp(kind, "folder") == 0);
+      int expected_folder = valid_kind && strcmp(kind, "folder") == 0;
+      int valid = parse_u32(object_token, &object_id) && object_id != 0 &&
+                  parse_u32(storage_token, &storage_id) && storage_id != 0 &&
+                  parse_u32(parent_token, &parent_id) && valid_kind &&
+                  parse_optional_u64(
+                      expected_size_token, &expected_size, &expected_size_available) &&
+                  parse_optional_u64(
+                      expected_modified_token, &expected_modified, &expected_modified_available) &&
+                  decode_phone_item_name(expected_name_token, 0, &expected_name);
+      int valid_file_metadata = expected_folder
+          ? !expected_size_available && !expected_modified_available
+          : expected_size_available &&
+            (!expected_modified_available || expected_modified > 0);
+      valid = valid && valid_file_metadata;
+      if (valid && new_name_token != NULL) {
+        valid = decode_phone_item_name(new_name_token, 1, &new_name);
+      }
+      if (!valid || (strcmp(command, "rename-item") == 0 && new_name == NULL)) {
+        free(expected_name);
+        free(new_name);
+        print_session_error(request_id, "Invalid phone mutation command.");
         continue;
       }
-      session_delete(request_id, device, object_id);
+
+      if (strcmp(command, "rename-item") == 0) {
+        session_rename_item(
+            request_id,
+            device,
+            object_id,
+            storage_id,
+            parent_id,
+            kind,
+            expected_size,
+            expected_size_available,
+            expected_modified,
+            expected_modified_available,
+            expected_name,
+            new_name);
+      } else {
+        session_delete_item(
+            request_id,
+            device,
+            object_id,
+            storage_id,
+            parent_id,
+            kind,
+            expected_size,
+            expected_size_available,
+            expected_modified,
+            expected_modified_available,
+            expected_name);
+      }
+      free(expected_name);
+      free(new_name);
       clear_session_fallback_files(&fallback_files, &fallback_attempted);
       continue;
     }

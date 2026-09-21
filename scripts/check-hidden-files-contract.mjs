@@ -58,8 +58,20 @@ assert.match(
 
 assert.match(
   app,
-  /SHOW_HIDDEN_STORAGE_KEY\s*=\s*'androidFileTransferForMacOS\.showHiddenFiles'/,
-  'Renderer must persist the hidden-file visibility preference.'
+  /PHONE_SHOW_HIDDEN_STORAGE_KEY\s*=\s*'androidFileTransferForMacOS\.phoneShowHiddenFiles'/,
+  'Renderer must persist the phone hidden-file visibility preference.'
+);
+
+assert.match(
+  app,
+  /MAC_SHOW_HIDDEN_STORAGE_KEY\s*=\s*'androidFileTransferForMacOS\.macShowHiddenFiles'/,
+  'Renderer must persist the Mac hidden-file visibility preference separately.'
+);
+
+assert.match(
+  app,
+  /LEGACY_SHOW_HIDDEN_STORAGE_KEY\s*=\s*'androidFileTransferForMacOS\.showHiddenFiles'/,
+  'Renderer must migrate the former shared hidden-file preference.'
 );
 
 assert.match(
@@ -70,20 +82,32 @@ assert.match(
 
 assert.match(
   app,
-  /visibleLocationRows[\s\S]*showHiddenFiles \|\| row\.kind === 'storage' \|\| !isHiddenFileName\(row\.name\)/,
+  /visibleLocationRows[\s\S]*phoneShowHiddenFiles \|\| row\.kind === 'storage' \|\| !isHiddenFileName\(row\.name\)/,
   'Phone rows must hide dotfiles and dotfolders unless the user enables hidden files.'
 );
 
 assert.match(
   app,
-  /className=\{`icon-button hidden-files-toggle \$\{showHiddenFiles \? 'active' : ''\}`\}/,
-  'Toolbar must expose a stateful hidden-file toggle.'
+  /className=\{`icon-button hidden-files-toggle \$\{phoneShowHiddenFiles \? 'active' : ''\}`\}/,
+  'Phone toolbar must expose its own stateful hidden-file toggle.'
 );
 
 assert.match(
   app,
-  /case 'toggle-hidden-files':[\s\S]*toggleHiddenFiles\(\)/,
-  'Renderer must handle the View menu hidden-file command.'
+  /className=\{`icon-button hidden-files-toggle \$\{macShowHiddenFiles \? 'active' : ''\}`\}/,
+  'Mac toolbar must expose its own stateful hidden-file toggle.'
+);
+
+assert.match(
+  app,
+  /listLocalDirectory\(\s*directoryPath,\s*options\.showHidden \?\? macShowHiddenFiles\s*\)/,
+  'Mac directory listing must use only the Mac visibility preference.'
+);
+
+assert.match(
+  app,
+  /case 'toggle-hidden-files':[\s\S]*toggleActivePaneHiddenFiles\(\)/,
+  'View menu hidden-file visibility must apply to the active pane.'
 );
 
 assert.match(
@@ -94,6 +118,6 @@ assert.match(
 
 assert.match(readme, /Show or hide hidden files/, 'README must document hidden-file visibility.');
 assert.match(checklist, /hidden files/, 'Manual checklist must cover hidden-file visibility.');
-assert.match(architecture, /hidden-file visibility/i, 'Architecture note must describe hidden-file visibility.');
+assert.match(architecture, /hidden-file (?:visibility )?preference/i, 'Architecture note must describe hidden-file visibility.');
 
 console.log('Hidden files contract check passed.');

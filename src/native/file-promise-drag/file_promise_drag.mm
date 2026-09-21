@@ -4,8 +4,11 @@
 #include <napi.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstring>
 #include <memory>
 #include <mutex>
+#include <stdio.h>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -484,10 +487,34 @@ Napi::Value FailAll(const Napi::CallbackInfo& info) {
   return env.Undefined();
 }
 
+Napi::Value AtomicExchangePaths(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (info.Length() != 2 || !info[0].IsString() || !info[1].IsString()) {
+    Napi::TypeError::New(env, "atomicExchangePaths requires two file paths")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  std::string leftPath = info[0].As<Napi::String>().Utf8Value();
+  std::string rightPath = info[1].As<Napi::String>().Utf8Value();
+  if (renamex_np(leftPath.c_str(), rightPath.c_str(), RENAME_SWAP) != 0) {
+    int errorNumber = errno;
+    Napi::Error error = Napi::Error::New(
+        env,
+        std::string("macOS atomic rename exchange failed: ") + std::strerror(errorNumber));
+    error.Value().Set("errno", Napi::Number::New(env, errorNumber));
+    error.ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  return env.Undefined();
+}
+
 Napi::Object Initialize(Napi::Env env, Napi::Object exports) {
   exports.Set("startDrag", Napi::Function::New(env, StartDrag));
   exports.Set("completePromise", Napi::Function::New(env, CompletePromise));
   exports.Set("failAll", Napi::Function::New(env, FailAll));
+  exports.Set("atomicExchangePaths", Napi::Function::New(env, AtomicExchangePaths));
   return exports;
 }
 

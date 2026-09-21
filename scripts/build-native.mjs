@@ -4,12 +4,13 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   rmSync,
   writeFileSync
 } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -21,24 +22,72 @@ const resourcesDir = resolve(root, 'resources');
 const output = resolve(resourcesDir, 'bin/mtp-json');
 const filePromiseOutput = resolve(resourcesDir, 'bin/file-promise-drag.node');
 const bundledLibDir = resolve(resourcesDir, 'lib');
-const targetArch = process.env.TARGET_ARCH || process.env.npm_config_arch || process.arch;
+const requestedArch = process.env.TARGET_ARCH || process.env.npm_config_arch || process.arch;
+const targetArch = requestedArch === 'x86_64' ? 'x64' : requestedArch;
+if (targetArch !== 'arm64' && targetArch !== 'x64') {
+  throw new Error(`Unsupported native architecture: ${requestedArch}`);
+}
 const clangArch = targetArch === 'x64' ? 'x86_64' : targetArch;
 const deploymentTarget = process.env.MACOSX_DEPLOYMENT_TARGET || '12.0';
-const nativeDepsPrefix = process.env.NATIVE_DEPS_PREFIX
+const packageBuild = process.env.NATIVE_BUILD_FOR_PACKAGE === '1';
+const declaredPackageMinimumMacOS = '12.0';
+const preparedNativeDepsPrefix = resolve(root, '.native-deps', targetArch);
+const requestedNativeDepsPrefix = process.env.NATIVE_DEPS_PREFIX
   ? resolve(process.env.NATIVE_DEPS_PREFIX)
   : null;
+if (
+  packageBuild &&
+  requestedNativeDepsPrefix &&
+  requestedNativeDepsPrefix !== preparedNativeDepsPrefix
+) {
+  throw new Error(
+    `Packaging must use the repository native dependencies at ${preparedNativeDepsPrefix}, not ${requestedNativeDepsPrefix}`
+  );
+}
+const nativeDepsPrefix = requestedNativeDepsPrefix ?? preparedNativeDepsPrefix;
 
 if (nativeDepsPrefix && !existsSync(nativeDepsPrefix)) {
-  throw new Error(`NATIVE_DEPS_PREFIX does not exist: ${nativeDepsPrefix}`);
+  const preparation = ` Run \`npm run native:deps -- ${targetArch}\` first.`;
+  throw new Error(`Native dependency prefix does not exist: ${nativeDepsPrefix}.${preparation}`);
 }
 
+if (packageBuild) {
+  if (deploymentTarget !== declaredPackageMinimumMacOS) {
+    throw new Error(
+      `Packaging must target macOS ${declaredPackageMinimumMacOS}, not ${deploymentTarget}.`
+    );
+  }
+  const requiredPreparedFiles = [
+    'lib/pkgconfig/libmtp.pc',
+    'lib/pkgconfig/libusb-1.0.pc',
+    'lib/libmtp.9.dylib',
+    'lib/libusb-1.0.0.dylib'
+  ];
+  for (const relativePath of requiredPreparedFiles) {
+    const requiredPath = resolve(nativeDepsPrefix, relativePath);
+    if (!existsSync(requiredPath)) {
+      throw new Error(
+        `Prepared native dependency is missing: ${requiredPath}. Run \`npm run native:deps -- ${targetArch}\` before packaging.`
+      );
+    }
+  }
+}
+
+const nativePkgConfigDir = nativeDepsPrefix
+  ? resolve(nativeDepsPrefix, 'lib/pkgconfig')
+  : null;
 const nativeEnv = {
   ...process.env,
   MACOSX_DEPLOYMENT_TARGET: deploymentTarget,
   ...(nativeDepsPrefix
-    ? {
+    ? packageBuild
+      ? {
+          PKG_CONFIG_PATH: nativePkgConfigDir,
+          PKG_CONFIG_LIBDIR: nativePkgConfigDir
+        }
+      : {
         PKG_CONFIG_PATH: [
-          resolve(nativeDepsPrefix, 'lib/pkgconfig'),
+          nativePkgConfigDir,
           process.env.PKG_CONFIG_PATH
         ]
           .filter(Boolean)
@@ -61,6 +110,19 @@ function run(command, args, options = {}) {
   }
 
   return result.stdout?.trim() ?? '';
+}
+
+if (packageBuild) {
+  run(process.execPath, [
+    resolve(root, 'scripts/check-macho.mjs'),
+    '--root',
+    resolve(nativeDepsPrefix, 'lib'),
+    '--arch',
+    targetArch,
+    '--max-macos',
+    declaredPackageMinimumMacOS,
+    '--allow-build-paths'
+  ]);
 }
 
 function nodeGypToolchainEnvironment() {
@@ -113,6 +175,15 @@ const libs = run('pkg-config', ['--libs', ...nativePackages], { capture: true })
 const libmtpDir = run('pkg-config', ['--variable=libdir', 'libmtp'], { capture: true });
 const libusbDir = run('pkg-config', ['--variable=libdir', 'libusb-1.0'], { capture: true });
 
+function assertPathInsidePreparedPrefix(path, description) {
+  const prefixPath = realpathSync(nativeDepsPrefix);
+  const candidatePath = realpathSync(path);
+  const relativePath = relative(prefixPath, candidatePath);
+  if (relativePath === '..' || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
+    throw new Error(`${description} resolved outside ${nativeDepsPrefix}: ${candidatePath}`);
+  }
+}
+
 function installName(binaryPath) {
   return run('otool', ['-D', binaryPath], { capture: true })
     .split('\n')
@@ -138,8 +209,13 @@ function relink(binaryPath, changes) {
   run('install_name_tool', args);
 }
 
-function adHocSign(binaryPath) {
-  run('codesign', ['--force', '--sign', '-', '--timestamp=none', binaryPath]);
+function adHocSign(binaryPath, entitlementsPath) {
+  const args = ['--force', '--sign', '-', '--timestamp=none'];
+  if (entitlementsPath) {
+    args.push('--entitlements', entitlementsPath);
+  }
+  args.push(binaryPath);
+  run('codesign', args);
 }
 
 run('clang', [
@@ -193,6 +269,10 @@ chmodSync(filePromiseOutput, 0o755);
 
 const sourceLibmtp = resolve(libmtpDir, 'libmtp.9.dylib');
 const sourceLibusb = resolve(libusbDir, 'libusb-1.0.0.dylib');
+if (packageBuild) {
+  assertPathInsidePreparedPrefix(sourceLibmtp, 'libmtp');
+  assertPathInsidePreparedPrefix(sourceLibusb, 'libusb');
+}
 const bundledLibmtp = bundleDylib(sourceLibmtp);
 const bundledLibusb = bundleDylib(sourceLibusb);
 const libmtpInstallName = installName(sourceLibmtp);
@@ -217,10 +297,13 @@ relink(output, [
 
 adHocSign(bundledLibusb);
 adHocSign(bundledLibmtp);
-adHocSign(output);
+adHocSign(output, resolve(root, 'build/entitlements.mtp-helper.plist'));
 adHocSign(filePromiseOutput);
 
 console.log(`Built ${output}`);
 console.log(`Built ${filePromiseOutput}`);
 console.log(`Bundled native libraries in ${bundledLibDir}`);
 console.log(`Native architecture: ${targetArch}; minimum macOS: ${deploymentTarget}`);
+if (nativeDepsPrefix) {
+  console.log(`Native dependency prefix: ${nativeDepsPrefix}${packageBuild ? ' (packaging)' : ''}`);
+}

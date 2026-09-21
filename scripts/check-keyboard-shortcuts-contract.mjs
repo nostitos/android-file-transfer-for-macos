@@ -17,7 +17,7 @@ assert.match(app, /key === 'f'[\s\S]*searchInputRef\.current\?\.focus\(\)/, 'Cmd
 assert.match(app, /key === 'r'[\s\S]*handleManualRefresh\(\)/, 'Cmd/Ctrl+R must refresh the phone connection.');
 assert.match(app, /key === '1'[\s\S]*focusPhonePane\(\)/, 'Cmd/Ctrl+1 must focus the phone pane.');
 assert.match(app, /key === '2'[\s\S]*focusMacPane\(\)/, 'Cmd/Ctrl+2 must focus the Mac pane.');
-assert.match(app, /key === 'n'[\s\S]*openNewFolderDialog\(\)/, 'Cmd/Ctrl+N must open New Folder for the phone pane.');
+assert.match(app, /key === 'n'[\s\S]*openNewFolderForActivePane\(\)/, 'Cmd/Ctrl+N must create a folder in the active pane.');
 assert.match(app, /key === 'b'[\s\S]*goUpActivePane\(\)/, 'Cmd/Ctrl+B must go up in the active pane.');
 assert.match(
   app,
@@ -50,8 +50,11 @@ assert.match(app, /function copyActivePaneSelectionToClipboard\(\)/, 'Renderer m
 assert.match(app, /function pasteTransferClipboard\(\)/, 'Renderer must expose a transfer clipboard paste helper.');
 assert.match(app, /sourceStillVisible/, 'Pasting copied phone rows must reject stale disconnected phone selections.');
 assert.match(app, /key === 'enter'[\s\S]*copyActivePaneSelectionToQueue\(\)/, 'Pane Cmd/Ctrl+Enter must copy the active-pane selection.');
-assert.doesNotMatch(app, /key === 'backspace'|event\.key === 'Backspace'/, 'Backspace delete must stay out of v1.');
-assert.doesNotMatch(app, /key === 'd'[\s\S]*(rename|Rename)/, 'Rename shortcut must stay out of v1.');
+assert.match(app, /event\.key === 'F2'[\s\S]*openRenamePhoneItemDialog\(\)/, 'F2 must rename one selected phone item.');
+assert.match(app, /event\.key === 'Backspace'.*event\.key === 'Delete'[\s\S]*deletePhoneRows\(\)/s, 'Delete keys must use guarded phone deletion.');
+assert.match(app, /key === 'd'[\s\S]*openRenameSelectedItem\(\)/, 'Cmd/Ctrl+D must rename in the active pane.');
+assert.match(app, /function handleLocalPaneKeyDown[\s\S]*event\.key === 'F2'[\s\S]*openRenameLocalItemDialog\(\)/, 'F2 must rename one selected Mac item.');
+assert.match(app, /function handleLocalPaneKeyDown[\s\S]*event\.key === 'Backspace'.*event\.key === 'Delete'[\s\S]*trashLocalEntries\(\)/s, 'Delete keys must move selected Mac items to Trash.');
 assert.match(app, /isInteractiveElement\(event\.target\)/, 'Pane shortcuts must not hijack buttons or form fields.');
 
 console.log('Keyboard shortcuts contract check passed.');

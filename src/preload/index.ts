@@ -1,11 +1,17 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type {
   AppMenuCommand,
+  CreateLocalFolderRequest,
   CreateFolderRequest,
+  DeletePhoneItemsRequest,
   FolderListProgress,
+  MtpConnectionPhaseEvent,
   MtpApi,
   PhoneFilePromiseDragEvent,
   PhoneFilePromiseDragRequest,
+  RenamePhoneItemRequest,
+  RenameLocalItemRequest,
+  TrashLocalItemsRequest,
   TransferEvent,
   TransferRequest,
   UploadRequest
@@ -16,7 +22,13 @@ const api: MtpApi = {
   scanInventory: () => ipcRenderer.invoke('mtp:scanInventory'),
   listFolder: (deviceIndex: number, deviceConnectionId: string, storageId: number, parentId: number) =>
     ipcRenderer.invoke('mtp:listFolder', deviceIndex, deviceConnectionId, storageId, parentId),
+  cancelConnectionAttempt: () => ipcRenderer.invoke('mtp:cancelConnectionAttempt'),
   cancelFolderListing: () => ipcRenderer.invoke('mtp:cancelFolderListing'),
+  onConnectionPhase: (callback: (event: MtpConnectionPhaseEvent) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: MtpConnectionPhaseEvent) => callback(payload);
+    ipcRenderer.on('mtp:connection-phase', listener);
+    return () => ipcRenderer.off('mtp:connection-phase', listener);
+  },
   onFolderListProgress: (callback: (progress: FolderListProgress) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, progress: FolderListProgress) =>
       callback(progress);
@@ -27,6 +39,9 @@ const api: MtpApi = {
     ipcRenderer.invoke('local:listDirectory', directoryPath, showHiddenFiles),
   inspectLocalPath: (path: string) => ipcRenderer.invoke('local:inspectPath', path),
   ensureLocalDirectory: (directoryPath: string) => ipcRenderer.invoke('local:ensureDirectory', directoryPath),
+  createLocalFolder: (request: CreateLocalFolderRequest) => ipcRenderer.invoke('local:createFolder', request),
+  renameLocalItem: (request: RenameLocalItemRequest) => ipcRenderer.invoke('local:renameItem', request),
+  trashLocalItems: (request: TrashLocalItemsRequest) => ipcRenderer.invoke('local:trashItems', request),
   setLocalModifiedTime: (path: string, modified: number) =>
     ipcRenderer.invoke('local:setModifiedTime', path, modified),
   getCommonMacFolders: () => ipcRenderer.invoke('local:getCommonFolders'),
@@ -38,15 +53,18 @@ const api: MtpApi = {
   startMoveDownloads: (requests: TransferRequest[]) => ipcRenderer.invoke('mtp:startMoveDownloads', requests),
   startMoveUploads: (requests: UploadRequest[]) => ipcRenderer.invoke('mtp:startMoveUploads', requests),
   createFolder: (request: CreateFolderRequest) => ipcRenderer.invoke('mtp:createFolder', request),
+  renamePhoneItem: (request: RenamePhoneItemRequest) => ipcRenderer.invoke('mtp:renamePhoneItem', request),
+  deletePhoneItems: (request: DeletePhoneItemsRequest) => ipcRenderer.invoke('mtp:deletePhoneItems', request),
   startPhoneFilePromiseDrag: (request: PhoneFilePromiseDragRequest) =>
     ipcRenderer.send('mtp:startPhoneFilePromiseDrag', request),
   startLocalFileDrag: (filePaths: string[]) => ipcRenderer.send('mtp:startLocalFileDrag', filePaths),
   cancelTransfer: (jobId: string) => ipcRenderer.invoke('mtp:cancelTransfer', jobId),
   retryTransfer: (jobId: string) => ipcRenderer.invoke('mtp:retryTransfer', jobId),
   revealInFinder: (path: string) => ipcRenderer.invoke('mtp:revealInFinder', path),
-  recoverWithAdmin: () => ipcRenderer.invoke('mtp:recoverWithAdmin'),
   openLog: () => ipcRenderer.invoke('mtp:openLog'),
   copyDiagnostics: () => ipcRenderer.invoke('mtp:copyDiagnostics'),
+  checkForUpdates: (interactive?: boolean) => ipcRenderer.invoke('app:checkForUpdates', interactive === true),
+  openUpdateRelease: (releaseTag: string) => ipcRenderer.invoke('app:openUpdateRelease', releaseTag),
   onTransferEvent: (callback: (event: TransferEvent) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: TransferEvent) => callback(payload);
     ipcRenderer.on('transfer:event', listener);
