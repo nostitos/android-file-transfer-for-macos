@@ -74,12 +74,12 @@
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@electron/osx-sign": "2.5.0",
     "@types/node": "^22.10.2",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^5.1.1",
-    "@electron/osx-sign": "2.5.0",
-    "electron": "41.7.1",
+    "electron": "41.10.7",
     "electron-builder": "26.15.3",
     "electron-vite": "^5.0.0",
     "node-addon-api": "^8.9.0",
