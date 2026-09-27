@@ -40,7 +40,8 @@ mkdir -p "$OUTPUT_ROOT"
 export TARGET_ARCH="$ARCH"
 export MACOSX_DEPLOYMENT_TARGET="$MINIMUM_MACOS"
 export NATIVE_DEPS_PREFIX="$ROOT/.native-deps/$ARCH"
-export CSC_NAME="$CSC_CERTIFICATE_NAME"
+# electron-builder expects the certificate's name without its Keychain kind prefix.
+export CSC_NAME="${CSC_CERTIFICATE_NAME#Developer ID Application: }"
 
 "$ROOT/scripts/build-native-deps.sh" "$ARCH"
 npm run check

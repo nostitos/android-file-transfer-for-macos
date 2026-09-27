@@ -5,7 +5,7 @@ The signed release workflow publishes only the exact commit identified by the wo
 ## Required workflow inputs
 
 - `signing_identity`: exact Developer ID Application identity reported by `security find-identity -v -p codesigning` after importing the release certificate.
-- `csc_certificate_name`: certificate name that `electron-builder` must select from that imported keychain.
+- `csc_certificate_name`: certificate name that `electron-builder` must select from that imported keychain. The release script accepts the full `Developer ID Application: ...` identity or the name without that prefix.
 - `team_id`: Apple Developer Team ID expected in every signed bundle component.
 
 The `release` environment must provide `MACOS_CERTIFICATE_P12`, `MACOS_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, and `APPLE_TEAM_ID`. The certificate identity and `team_id` inputs must match the imported certificate. The workflow removes its temporary keychain after each matrix job.
