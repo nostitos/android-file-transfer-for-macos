@@ -55,6 +55,11 @@ APP_PATH="$(find "$OUTPUT_ROOT" -maxdepth 3 -type d -name "$PRODUCT_NAME.app" -p
 [[ -n "$APP_PATH" ]]
 
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+if [[ "$ARCH" == x64 && "$(uname -m)" == arm64 ]]; then
+  REQUIRE_NATIVE_HOST=false bash "$ROOT/scripts/smoke-packaged-app.sh" "$APP_PATH" "$ARCH"
+else
+  bash "$ROOT/scripts/smoke-packaged-app.sh" "$APP_PATH" "$ARCH"
+fi
 APP_ZIP="$OUTPUT_ROOT/Android-File-Transfer-for-macOS-$VERSION-$ARCH.zip"
 [[ -f "$APP_ZIP" ]]
 xcrun notarytool submit "$APP_ZIP" "${NOTARY_AUTH[@]}" --wait
