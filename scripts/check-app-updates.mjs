@@ -15,7 +15,7 @@ await writeFile(outPath, ts.transpileModule(updateSource, {
   compilerOptions: { module: ts.ModuleKind.ES2022, target: ts.ScriptTarget.ES2022 }
 }).outputText, 'utf8');
 
-const { compareSemanticVersions, normalizeSemanticVersion, selectLatestRelease } = await import(
+const { classifyUpdateInstallLocation, compareSemanticVersions, normalizeSemanticVersion, selectLatestRelease } = await import(
   `${pathToFileURL(outPath).href}?t=${Date.now()}`
 );
 
@@ -65,6 +65,20 @@ assert.deepEqual(
   { version: '0.10.0', tag: 'v0.10.0' }
 );
 assert.equal(selectLatestRelease('1.0.0', [{ tag_name: 'v1.0.0' }, { tag_name: 'v0.9.9' }]), null);
+assert.equal(
+  classifyUpdateInstallLocation(
+    '/Applications/Android File Transfer for macOS.app/Contents/MacOS/Android File Transfer for macOS',
+    '/Users/example/Downloads'
+  ).reason,
+  null
+);
+for (const executable of [
+  '/Volumes/Android File Transfer/Android File Transfer for macOS.app/Contents/MacOS/Android File Transfer for macOS',
+  '/private/var/folders/abc/AppTranslocation/xyz/d/Android File Transfer for macOS.app/Contents/MacOS/Android File Transfer for macOS',
+  '/Users/example/Downloads/Android File Transfer for macOS.app/Contents/MacOS/Android File Transfer for macOS'
+]) {
+  assert.match(classifyUpdateInstallLocation(executable, '/Users/example/Downloads').reason, /Move the app/);
+}
 
 const [types, main, preload, app, styles, menuCheck, packageJson] = await Promise.all([
   readProjectFile('src/shared/types.ts'),
@@ -78,23 +92,35 @@ const [types, main, preload, app, styles, menuCheck, packageJson] = await Promis
 
 assert.match(types, /interface AppUpdateCheckResult/);
 assert.match(types, /checkForUpdates: \(interactive\?: boolean\)/);
+assert.match(types, /downloadUpdate: \(\)/);
+assert.match(types, /installUpdate: \(\)/);
+assert.match(types, /onAppUpdateStatus: \(callback:/);
 assert.match(types, /openUpdateRelease: \(releaseTag: string\)/);
-assert.match(main, /UPDATE_CHECK_TIMEOUT_MS/);
-assert.match(main, /UPDATE_RESPONSE_MAX_BYTES/);
-assert.match(main, /net\.fetch\(GITHUB_RELEASES_API/);
-assert.match(main, /selectLatestRelease\(currentVersion/);
+assert.match(main, /autoUpdater\.autoDownload = false/);
+assert.match(main, /autoUpdater\.autoInstallOnAppQuit = false/);
+assert.match(main, /autoUpdater\.checkForUpdates\(\)/);
+assert.match(main, /autoUpdater\.downloadUpdate\(\)/);
+assert.match(main, /autoUpdater\.quitAndInstall\(\)/);
+assert.doesNotMatch(main, /net\.fetch\(GITHUB_RELEASES_API/);
 assert.match(main, /updateCheckInFlight/);
 assert.match(main, /GITHUB_RELEASES_WEB.*github\.com\/nostitos\/android-file-transfer-for-macos\/releases\/tag/s);
 assert.match(main, /normalizeSemanticVersion\(releaseTag\)/);
 assert.match(main, /label:\s*'Check for Updates\.\.\.'/);
 assert.match(main, /ipcMain\.handle\('app:checkForUpdates'/);
+assert.match(main, /ipcMain\.handle\('app:downloadUpdate'/);
+assert.match(main, /ipcMain\.handle\('app:installUpdate'/);
 assert.match(main, /ipcMain\.handle\('app:openUpdateRelease'/);
 assert.match(preload, /ipcRenderer\.invoke\('app:checkForUpdates'/);
+assert.match(preload, /ipcRenderer\.invoke\('app:downloadUpdate'/);
+assert.match(preload, /ipcRenderer\.invoke\('app:installUpdate'/);
+assert.match(preload, /ipcRenderer\.on\('app:update-status'/);
 assert.match(preload, /ipcRenderer\.invoke\('app:openUpdateRelease'/);
 assert.match(app, /AUTO_UPDATE_CHECK_INTERVAL_MS = 24 \* 60 \* 60 \* 1000/);
 assert.match(app, /automaticUpdateCheckIsDue/);
 assert.match(app, /case 'check-for-updates':[\s\S]*checkAppUpdates\(true\)/);
 assert.match(app, /appUpdate\?\.status === 'update-available'/);
+assert.match(app, /appUpdate\?\.status === 'downloading'/);
+assert.match(app, /appUpdate\?\.status === 'ready-to-install'/);
 assert.match(styles, /\.update-action\.available/);
 assert.match(menuCheck, /Check for Updates/);
 assert.match(packageJson, /"check:app-updates"/);

@@ -79,7 +79,7 @@ assert.match(
 );
 assert.match(
   packageMacScript,
-  /MACOSX_DEPLOYMENT_TARGET=12\.0 NATIVE_BUILD_FOR_PACKAGE=1 npm run build[\s\S]*smoke-current-package\.mjs --prepare[\s\S]*electron-builder[\s\S]*smoke-current-package\.mjs$/,
+  /MACOSX_DEPLOYMENT_TARGET=13\.0 NATIVE_BUILD_FOR_PACKAGE=1 npm run build[\s\S]*smoke-current-package\.mjs --prepare[\s\S]*electron-builder[\s\S]*smoke-current-package\.mjs$/,
   'Local macOS packaging must pin the declared deployment target, use prepared native dependencies, and bracket electron-builder with package smoke preparation and validation.'
 );
 assert.match(mainSource, /--file-promise-smoke/, 'The packaged app must expose a native addon load smoke mode.');

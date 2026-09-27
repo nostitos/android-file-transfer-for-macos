@@ -2,19 +2,27 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DMG_PATH="${1:?Usage: verify-macos-release.sh DMG_PATH arm64|x64 [VERSION]}"
-ARCH="${2:?Usage: verify-macos-release.sh DMG_PATH arm64|x64 [VERSION]}"
+ARTIFACT_PATH="${1:?Usage: verify-macos-release.sh DMG_OR_ZIP_PATH arm64|x64 [VERSION]}"
+ARCH="${2:?Usage: verify-macos-release.sh DMG_OR_ZIP_PATH arm64|x64 [VERSION]}"
 DEFAULT_VERSION="$(node -p 'require(process.argv[1]).version' "$ROOT/package.json")"
 EXPECTED_VERSION="${3:-$DEFAULT_VERSION}"
 EXPECTED_TEAM_ID="${EXPECTED_TEAM_ID:?Set EXPECTED_TEAM_ID to the signing certificate Apple Developer Team ID.}"
-EXPECTED_MINIMUM_MACOS="${EXPECTED_MINIMUM_MACOS:-12.0}"
+EXPECTED_MINIMUM_MACOS="${EXPECTED_MINIMUM_MACOS:-$(node -p 'require(process.argv[1]).build.mac.minimumSystemVersion' "$ROOT/package.json")}"
 PRODUCT_NAME="Android File Transfer for macOS"
-EXPECTED_DMG_NAME="Android-File-Transfer-for-macOS-$EXPECTED_VERSION-$ARCH.dmg"
-MOUNT_POINT="$(mktemp -d "${TMPDIR:-/tmp}/android-file-transfer-dmg.XXXXXX")"
+ARTIFACT_NAME="$(basename "$ARTIFACT_PATH")"
+STAGE_POINT="$(mktemp -d "${TMPDIR:-/tmp}/android-file-transfer-release.XXXXXX")"
+MOUNTED=false
 
 cleanup() {
-  hdiutil detach "$MOUNT_POINT" -quiet >/dev/null 2>&1 || true
-  rmdir "$MOUNT_POINT" >/dev/null 2>&1 || true
+  if [[ "$MOUNTED" == true ]]; then
+    if hdiutil detach "$STAGE_POINT" -quiet >/dev/null 2>&1; then
+      rmdir "$STAGE_POINT" >/dev/null 2>&1 || true
+    else
+      echo "Could not detach release DMG at $STAGE_POINT" >&2
+    fi
+  else
+    rm -rf "$STAGE_POINT"
+  fi
 }
 trap cleanup EXIT
 
@@ -23,7 +31,11 @@ case "$ARCH" in
   *) echo "Unsupported architecture: $ARCH" >&2; exit 2 ;;
 esac
 
-[[ "$(basename "$DMG_PATH")" == "$EXPECTED_DMG_NAME" ]]
+case "$ARTIFACT_NAME" in
+  "Android-File-Transfer-for-macOS-$EXPECTED_VERSION-$ARCH.dmg") ARTIFACT_KIND=dmg ;;
+  "Android-File-Transfer-for-macOS-$EXPECTED_VERSION-$ARCH.zip") ARTIFACT_KIND=zip ;;
+  *) echo "Unexpected release artifact name: $ARTIFACT_NAME" >&2; exit 1 ;;
+esac
 
 signing_details() {
   codesign -dv --verbose=4 "$1" 2>&1
@@ -56,15 +68,37 @@ assert_usb_entitlement() {
   ' <<< "$entitlements"
 }
 
-codesign --verify --verbose=2 "$DMG_PATH"
-xcrun stapler validate "$DMG_PATH"
-spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG_PATH"
-hdiutil attach "$DMG_PATH" -nobrowse -readonly -mountpoint "$MOUNT_POINT" -quiet
+if [[ "$ARTIFACT_KIND" == dmg ]]; then
+  codesign --verify --verbose=2 "$ARTIFACT_PATH"
+  xcrun stapler validate "$ARTIFACT_PATH"
+  spctl --assess --type open --context context:primary-signature --verbose=4 "$ARTIFACT_PATH"
+  hdiutil attach "$ARTIFACT_PATH" -nobrowse -readonly -mountpoint "$STAGE_POINT" -quiet
+  MOUNTED=true
+else
+  ditto -x -k "$ARTIFACT_PATH" "$STAGE_POINT"
+fi
 
-APP_PATH="$MOUNT_POINT/$PRODUCT_NAME.app"
+APP_PATH="$STAGE_POINT/$PRODUCT_NAME.app"
 INFO_PLIST="$APP_PATH/Contents/Info.plist"
 HELPER="$APP_PATH/Contents/Resources/bin/mtp-json"
+UPDATE_CONFIG="$APP_PATH/Contents/Resources/app-update.yml"
 [[ -d "$APP_PATH" && -f "$INFO_PLIST" ]]
+[[ -f "$UPDATE_CONFIG" ]]
+node --input-type=module - "$UPDATE_CONFIG" <<'NODE'
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+
+const config = readFileSync(process.argv[2], 'utf8');
+for (const [key, expected] of Object.entries({
+  provider: 'github',
+  owner: 'nostitos',
+  repo: 'android-file-transfer-for-macos'
+})) {
+  const matches = [...config.matchAll(new RegExp(`^${key}:\\s*([^\\s#]+)\\s*$`, 'gm'))];
+  assert.equal(matches.length, 1, `Expected exactly one ${key} field in app-update.yml`);
+  assert.equal(matches[0][1].replace(/^['"]|['"]$/g, ''), expected, `Unexpected ${key} in app-update.yml`);
+}
+NODE
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 xcrun stapler validate "$APP_PATH"
 spctl --assess --type execute --verbose=4 "$APP_PATH"
@@ -88,4 +122,4 @@ done
 assert_hardened_runtime "$HELPER"
 assert_usb_entitlement "$HELPER"
 node "$ROOT/scripts/check-macho.mjs" --root "$APP_PATH" --arch "$ARCH" --max-macos "$EXPECTED_MINIMUM_MACOS"
-echo "Verified signed, notarized $ARCH DMG for version $EXPECTED_VERSION: $DMG_PATH"
+echo "Verified signed, notarized $ARCH $ARTIFACT_KIND for version $EXPECTED_VERSION: $ARTIFACT_PATH"

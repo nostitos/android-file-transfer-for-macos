@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type {
   AppMenuCommand,
+  AppUpdateCheckResult,
   CreateLocalFolderRequest,
   CreateFolderRequest,
   DeletePhoneItemsRequest,
@@ -64,8 +65,16 @@ const api: MtpApi = {
   revealInFinder: (path: string) => ipcRenderer.invoke('mtp:revealInFinder', path),
   openLog: () => ipcRenderer.invoke('mtp:openLog'),
   copyDiagnostics: () => ipcRenderer.invoke('mtp:copyDiagnostics'),
+  getUpdateStatus: () => ipcRenderer.invoke('app:getUpdateStatus'),
   checkForUpdates: (interactive?: boolean) => ipcRenderer.invoke('app:checkForUpdates', interactive === true),
+  downloadUpdate: () => ipcRenderer.invoke('app:downloadUpdate'),
+  installUpdate: () => ipcRenderer.invoke('app:installUpdate'),
   openUpdateRelease: (releaseTag: string) => ipcRenderer.invoke('app:openUpdateRelease', releaseTag),
+  onAppUpdateStatus: (callback: (status: AppUpdateCheckResult) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, status: AppUpdateCheckResult) => callback(status);
+    ipcRenderer.on('app:update-status', listener);
+    return () => ipcRenderer.off('app:update-status', listener);
+  },
   onTransferEvent: (callback: (event: TransferEvent) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: TransferEvent) => callback(payload);
     ipcRenderer.on('transfer:event', listener);

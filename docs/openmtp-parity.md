@@ -22,8 +22,8 @@ This matrix tracks user-visible capability against the current `ganeshrvel/openm
 | Privacy: no PII collection | Implemented | No telemetry; diagnostics exclude file listings. |
 | Local-pane create, rename, and delete | Implemented | Local delete uses recoverable macOS Trash rather than permanent removal. |
 | Collision replace/overwrite workflow | Implemented; real-device matrix pending | One batch choice offers Keep Both, Replace, Skip Existing, or Cancel. Mac replacement is identity-checked and atomic; phone replacement stages, verifies, backs up, publishes, and then cleans up. |
-| In-app update checks | Partial | Quiet daily and explicit Help-menu checks use GitHub releases. Automatic download, beta-channel control, and an auto-check preference are not implemented. |
+| In-app updates | Implemented for v0.2.0; release acceptance pending | Quiet daily and explicit Help-menu checks use the GitHub update manifest. Download and restart each require user action; beta-channel control and an auto-check preference are not implemented. |
 | Intel packaged build and broad device acceptance | Published builds verified; device matrix pending | The v0.1.0 arm64 and x64 DMGs pass signature, notarization, architecture, entitlement, and macOS 12 checks. The hardened next-release workflow has not yet been run with live Apple credentials. |
-| macOS version support | Partial | The app currently requires macOS 12; OpenMTP also supports macOS 11 Big Sur. |
+| macOS version support | Intentional difference | v0.2.0 targets macOS 13 or newer. The historical v0.1.0 artifacts target macOS 12. |
 
 The parity goal remains open until pending rows are implemented or explicitly accepted as safer product differences and the real-device acceptance checklist passes.

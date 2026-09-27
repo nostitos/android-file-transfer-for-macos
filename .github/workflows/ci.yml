@@ -21,7 +21,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       TARGET_ARCH: ${{ matrix.arch }}
-      MACOSX_DEPLOYMENT_TARGET: "12.0"
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
       NATIVE_DEPS_PREFIX: ${{ github.workspace }}/.native-deps/${{ matrix.arch }}
       CSC_IDENTITY_AUTO_DISCOVERY: "false"
     steps:

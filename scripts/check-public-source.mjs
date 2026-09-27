@@ -13,6 +13,7 @@ const forbiddenPatterns = [
   /macAndroidTransfer/,
   /dev\.macandroidtransfer/,
   /\bR[0-9A-Z]{10}\b/,
+  /\b(?=[A-Z0-9]{14}\b)(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*[0-9])[A-Z0-9]{14}\b/,
   /\b(?:photo_)?20\d{6}[_-]\d{6}\b/i,
   /\/Users\/t\//,
   /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,

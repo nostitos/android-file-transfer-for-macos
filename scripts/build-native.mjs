@@ -28,9 +28,12 @@ if (targetArch !== 'arm64' && targetArch !== 'x64') {
   throw new Error(`Unsupported native architecture: ${requestedArch}`);
 }
 const clangArch = targetArch === 'x64' ? 'x86_64' : targetArch;
-const deploymentTarget = process.env.MACOSX_DEPLOYMENT_TARGET || '12.0';
+const declaredPackageMinimumMacOS = require(resolve(root, 'package.json')).build?.mac?.minimumSystemVersion;
+if (!declaredPackageMinimumMacOS) {
+  throw new Error('package.json must declare build.mac.minimumSystemVersion.');
+}
+const deploymentTarget = process.env.MACOSX_DEPLOYMENT_TARGET || declaredPackageMinimumMacOS;
 const packageBuild = process.env.NATIVE_BUILD_FOR_PACKAGE === '1';
-const declaredPackageMinimumMacOS = '12.0';
 const preparedNativeDepsPrefix = resolve(root, '.native-deps', targetArch);
 const requestedNativeDepsPrefix = process.env.NATIVE_DEPS_PREFIX
   ? resolve(process.env.NATIVE_DEPS_PREFIX)

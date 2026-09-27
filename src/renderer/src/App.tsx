@@ -2687,6 +2687,21 @@ export function App(): JSX.Element {
     }
   }
 
+  async function downloadAvailableUpdate(): Promise<void> {
+    const result = await window.mtp.downloadUpdate();
+    setAppUpdate(result);
+    if (!result.ok || result.canInstallInPlace === false) {
+      setTransferNotice({ phase: 'failed', message: result.message });
+    }
+  }
+
+  async function restartToInstallUpdate(): Promise<void> {
+    const result = await window.mtp.installUpdate();
+    if (!result.ok) {
+      setTransferNotice({ phase: 'failed', message: result.message });
+    }
+  }
+
   function getPhoneGridColumnCount(): number {
     const grid = phoneBrowserRef.current?.querySelector('.file-grid');
     if (!(grid instanceof HTMLElement)) {
@@ -4803,6 +4818,12 @@ export function App(): JSX.Element {
   useEffect(() => window.mtp.onAppMenuCommand(handleAppMenuCommand));
 
   useEffect(() => {
+    const unsubscribe = window.mtp.onAppUpdateStatus(setAppUpdate);
+    void window.mtp.getUpdateStatus().then(setAppUpdate);
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => {
     if (!automaticUpdateCheckIsDue()) {
       return;
     }
@@ -4876,21 +4897,48 @@ export function App(): JSX.Element {
           <span>Android File Transfer for macOS</span>
         </div>
         <div className="topbar-actions">
-          {updateCheckBusy ? (
+          {updateCheckBusy || appUpdate?.status === 'checking' ? (
             <button type="button" className="update-action" disabled aria-label="Checking for updates">
               <Loader2 size={13} className="spin" />
               <span>Checking</span>
+            </button>
+          ) : appUpdate?.status === 'downloading' ? (
+            <button type="button" className="update-action" disabled aria-label="Downloading update">
+              <Loader2 size={13} className="spin" />
+              <span>Downloading {Math.floor(appUpdate.downloadPercent ?? 0)}%</span>
+            </button>
+          ) : appUpdate?.status === 'ready-to-install' ? (
+            <button
+              type="button"
+              className="update-action available"
+              aria-label={`Restart to install version ${appUpdate.latestVersion}`}
+              title={queueActive ? 'Finish transfers before restarting' : appUpdate.message}
+              onClick={() => void restartToInstallUpdate()}
+              disabled={queueActive}
+            >
+              <RotateCcw size={13} />
+              <span>Restart to update</span>
             </button>
           ) : appUpdate?.status === 'update-available' && appUpdate.latestVersion && appUpdate.releaseTag ? (
             <button
               type="button"
               className="update-action available"
               aria-label={`Version ${appUpdate.latestVersion} is available`}
-              title={`View version ${appUpdate.latestVersion} on GitHub`}
+              title={appUpdate.message}
+              onClick={() => void (appUpdate.canInstallInPlace ? downloadAvailableUpdate() : openAvailableUpdate())}
+            >
+              {appUpdate.canInstallInPlace ? <Download size={13} /> : <ExternalLink size={13} />}
+              <span>{appUpdate.canInstallInPlace ? 'Download update' : 'View update'}</span>
+            </button>
+          ) : appUpdate?.status === 'error' && appUpdate.releaseTag ? (
+            <button
+              type="button"
+              className="update-action available"
+              title="Download the release from GitHub"
               onClick={() => void openAvailableUpdate()}
             >
               <ExternalLink size={13} />
-              <span>Update</span>
+              <span>View update</span>
             </button>
           ) : null}
           <div className="theme-switch" role="group" aria-label="Theme">

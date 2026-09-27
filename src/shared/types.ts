@@ -460,7 +460,14 @@ export interface DiagnosticsCopyResult {
   text: string;
 }
 
-export type AppUpdateCheckStatus = 'update-available' | 'up-to-date' | 'error';
+export type AppUpdateCheckStatus =
+  | 'idle'
+  | 'checking'
+  | 'update-available'
+  | 'downloading'
+  | 'ready-to-install'
+  | 'up-to-date'
+  | 'error';
 
 export interface AppUpdateCheckResult {
   ok: boolean;
@@ -470,6 +477,8 @@ export interface AppUpdateCheckResult {
   releaseTag?: string;
   checkedAt: string;
   message: string;
+  canInstallInPlace?: boolean;
+  downloadPercent?: number;
 }
 
 export interface OpenUpdateReleaseResult {
@@ -538,8 +547,12 @@ export interface MtpApi {
   revealInFinder: (path: string) => Promise<void>;
   openLog: () => Promise<void>;
   copyDiagnostics: () => Promise<DiagnosticsCopyResult>;
+  getUpdateStatus: () => Promise<AppUpdateCheckResult>;
   checkForUpdates: (interactive?: boolean) => Promise<AppUpdateCheckResult>;
+  downloadUpdate: () => Promise<AppUpdateCheckResult>;
+  installUpdate: () => Promise<OpenUpdateReleaseResult>;
   openUpdateRelease: (releaseTag: string) => Promise<OpenUpdateReleaseResult>;
+  onAppUpdateStatus: (callback: (status: AppUpdateCheckResult) => void) => () => void;
   onTransferEvent: (callback: (event: TransferEvent) => void) => () => void;
   onPhoneFilePromiseDragEvent: (callback: (event: PhoneFilePromiseDragEvent) => void) => () => void;
   onAppMenuCommand: (callback: (command: AppMenuCommand) => void) => () => void;
