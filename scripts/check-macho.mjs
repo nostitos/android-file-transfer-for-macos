@@ -8,7 +8,7 @@ const rootIndex = args.indexOf('--root');
 const archIndex = args.indexOf('--arch');
 const maxIndex = args.indexOf('--max-macos');
 const allowBuildPaths = args.includes('--allow-build-paths');
-assert.ok(rootIndex >= 0 && args[rootIndex + 1], 'Usage: check-macho.mjs --root PATH --arch arm64|x64 [--max-macos 12.0]');
+assert.ok(rootIndex >= 0 && args[rootIndex + 1], 'Usage: check-macho.mjs --root PATH --arch arm64|x64 [--max-macos 13.0]');
 
 const root = resolve(args[rootIndex + 1]);
 assert.ok(existsSync(root), `Mach-O validation root does not exist: ${root}`);
@@ -18,7 +18,7 @@ assert.ok(
   `Unsupported Mach-O architecture: ${requestedArch}`
 );
 const expectedArch = requestedArch === 'x64' ? 'x86_64' : requestedArch;
-const maximumMacOS = maxIndex >= 0 ? args[maxIndex + 1] : '12.0';
+const maximumMacOS = maxIndex >= 0 ? args[maxIndex + 1] : '13.0';
 assert.match(maximumMacOS, /^\d+(?:\.\d+){0,2}$/, `Invalid maximum macOS version: ${maximumMacOS}`);
 
 function run(command, commandArgs) {

@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ARCH="${1:?Usage: release-macos.sh arm64|x64}"
 VERSION="$(node -p "require('$ROOT/package.json').version")"
+MINIMUM_MACOS="$(node -p "require('$ROOT/package.json').build.mac.minimumSystemVersion")"
 PRODUCT_NAME="Android File Transfer for macOS"
 SIGNING_IDENTITY="${SIGNING_IDENTITY:?Set SIGNING_IDENTITY to the exact Developer ID Application identity.}"
 CSC_CERTIFICATE_NAME="${CSC_CERTIFICATE_NAME:?Set CSC_CERTIFICATE_NAME to the certificate name electron-builder must select.}"
@@ -37,28 +38,43 @@ rm -rf "$OUTPUT_ROOT"
 mkdir -p "$OUTPUT_ROOT"
 
 export TARGET_ARCH="$ARCH"
-export MACOSX_DEPLOYMENT_TARGET=12.0
+export MACOSX_DEPLOYMENT_TARGET="$MINIMUM_MACOS"
 export NATIVE_DEPS_PREFIX="$ROOT/.native-deps/$ARCH"
-export CSC_NAME="$CSC_CERTIFICATE_NAME"
+# electron-builder expects the certificate's name without its Keychain kind prefix.
+export CSC_NAME="${CSC_CERTIFICATE_NAME#Developer ID Application: }"
 
 "$ROOT/scripts/build-native-deps.sh" "$ARCH"
 npm run check
 npm run check:public-source
 npm audit --omit=dev --audit-level=high
-node "$ROOT/scripts/check-macho.mjs" --root "$ROOT/resources" --arch "$ARCH" --max-macos 12.0
+node "$ROOT/scripts/check-macho.mjs" --root "$ROOT/resources" --arch "$ARCH" --max-macos "$MINIMUM_MACOS"
 
-npx electron-builder --mac dir "$BUILDER_ARCH_FLAG" --publish never \
+npx electron-builder --mac zip "$BUILDER_ARCH_FLAG" --publish never \
   --config.directories.output="$OUTPUT_ROOT"
 APP_PATH="$(find "$OUTPUT_ROOT" -maxdepth 3 -type d -name "$PRODUCT_NAME.app" -print -quit)"
 [[ -n "$APP_PATH" ]]
 
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
-APP_ZIP="$OUTPUT_ROOT/$PRODUCT_NAME-$ARCH.zip"
-ditto -c -k --keepParent "$APP_PATH" "$APP_ZIP"
+if [[ "$ARCH" == x64 && "$(uname -m)" == arm64 ]]; then
+  REQUIRE_NATIVE_HOST=false bash "$ROOT/scripts/smoke-packaged-app.sh" "$APP_PATH" "$ARCH"
+else
+  bash "$ROOT/scripts/smoke-packaged-app.sh" "$APP_PATH" "$ARCH"
+fi
+APP_ZIP="$OUTPUT_ROOT/Android-File-Transfer-for-macOS-$VERSION-$ARCH.zip"
+[[ -f "$APP_ZIP" ]]
 xcrun notarytool submit "$APP_ZIP" "${NOTARY_AUTH[@]}" --wait
 xcrun stapler staple "$APP_PATH"
 xcrun stapler validate "$APP_PATH"
 rm -f "$APP_ZIP"
+
+# The first ZIP makes electron-builder write app-update.yml before signing and
+# serves as Apple's notarization submission. Replace it with a ZIP of the
+# stapled app; the pre-staple ZIP must never be offered as an update payload.
+npx electron-builder --mac zip "$BUILDER_ARCH_FLAG" --publish never \
+  --prepackaged "$APP_PATH" \
+  --config.directories.output="$OUTPUT_ROOT"
+UPDATE_ZIP="$OUTPUT_ROOT/Android-File-Transfer-for-macOS-$VERSION-$ARCH.zip"
+[[ -f "$UPDATE_ZIP" ]]
 
 npx electron-builder --mac dmg "$BUILDER_ARCH_FLAG" --publish never \
   --prepackaged "$APP_PATH" \
@@ -73,6 +89,10 @@ xcrun stapler staple "$DMG_PATH"
 xcrun stapler validate "$DMG_PATH"
 
 FINAL_DMG="$ASSET_DIR/$(basename "$DMG_PATH")"
+FINAL_ZIP="$ASSET_DIR/$(basename "$UPDATE_ZIP")"
 cp "$DMG_PATH" "$FINAL_DMG"
+cp "$UPDATE_ZIP" "$FINAL_ZIP"
 "$ROOT/scripts/verify-macos-release.sh" "$FINAL_DMG" "$ARCH" "$VERSION"
+"$ROOT/scripts/verify-macos-release.sh" "$FINAL_ZIP" "$ARCH" "$VERSION"
 echo "$FINAL_DMG"
+echo "$FINAL_ZIP"

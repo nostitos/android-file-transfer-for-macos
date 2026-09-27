@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ARCH="${1:-${TARGET_ARCH:-$(uname -m)}}"
-DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
+DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
 LIBUSB_VERSION="1.0.30"
 LIBMTP_VERSION="1.1.23"
 LIBMTP_PATCH="$ROOT/patches/libmtp-1.1.23-no-usb-reset.patch"

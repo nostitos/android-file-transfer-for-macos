@@ -9,6 +9,37 @@ export interface SelectedRelease {
   tag: string;
 }
 
+export interface UpdateInstallLocation {
+  appBundlePath: string | null;
+  reason: string | null;
+}
+
+// Squirrel.Mac replaces an installed .app. A mounted DMG or a translocated
+// copy is temporary, and a copy in Downloads should be moved to Applications
+// before the user is offered an in-place update.
+export function classifyUpdateInstallLocation(
+  executablePath: string,
+  downloadsPath: string
+): UpdateInstallLocation {
+  const match = /^(.*\.app)\/Contents\/MacOS\/[^/]+$/.exec(executablePath);
+  if (!match) {
+    return { appBundlePath: null, reason: 'Move the app to Applications before updating.' };
+  }
+  const appBundlePath = match[1];
+  const inDownloads = appBundlePath === downloadsPath || appBundlePath.startsWith(`${downloadsPath}/`);
+  if (
+    appBundlePath.startsWith('/Volumes/') ||
+    appBundlePath.includes('/AppTranslocation/') ||
+    inDownloads
+  ) {
+    return {
+      appBundlePath,
+      reason: 'Move the app to Applications before updating. You can also download the new version from GitHub.'
+    };
+  }
+  return { appBundlePath, reason: null };
+}
+
 interface ParsedVersion {
   core: [bigint, bigint, bigint];
   prerelease: string[];

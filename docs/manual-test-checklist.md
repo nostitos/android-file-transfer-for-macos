@@ -1,6 +1,6 @@
 # Manual Test Checklist
 
-Use a real Android phone connected over USB. Samsung Galaxy S24-class devices, including SM-S928W-style behavior, are a priority test target.
+Use a real Android phone connected over USB. Samsung Galaxy S24-class devices, including SM-S928W-style behavior, and Pixel 9 devices are primary test targets.
 
 ## Setup
 
@@ -13,7 +13,7 @@ Use a real Android phone connected over USB. Samsung Galaxy S24-class devices, i
 - Unlock the phone.
 - Choose File Transfer / Android Auto from the Android USB notification.
 
-For the authorized Pixel 9 test device `4B090DLAQ00062`, record `adb shell svc usb getFunctions` and `getprop sys.usb.config` before each test. Use `adb shell svc usb setFunctions` for the charging/debug baseline and `adb shell svc usb setFunctions mtp` for File Transfer. Verify each mode in both ADB and macOS IOKit. A mode change may temporarily disconnect ADB; wait for that serial to return instead of assuming the command failed. Restore the original functions afterward. Never call `svc usb resetUsbGadget` from the app or test harness.
+For an authorized Pixel 9 test device, identify it locally with `adb devices` and use `<your-device-serial>` as the placeholder in shared notes. Record `adb shell svc usb getFunctions` and `getprop sys.usb.config` before each test. Use `adb shell svc usb setFunctions` for the charging/debug baseline and `adb shell svc usb setFunctions mtp` for File Transfer. Verify each mode in both ADB and macOS IOKit. A mode change may temporarily disconnect ADB; wait for the same device to return instead of assuming the command failed. Restore the original functions afterward. Keep the device serial out of commits and public reports. Never call `svc usb resetUsbGadget` from the app or test harness.
 
 ## Acceptance Flow
 
@@ -47,7 +47,7 @@ For the authorized Pixel 9 test device `4B090DLAQ00062`, record `adb shell svc u
 - Right-click empty space in each pane and confirm pane-level actions such as Check Phone Now, Refresh Mac Folder, Parent Folder, Choose Mac Folder, and New Phone Folder are understandable and enabled only when valid.
 - From the macOS menu bar, confirm File > New Folder, File > Check Phone Now, Edit > Rename Selected Item, Edit > Delete Selected Items, Edit > Copy File Selection, Edit > Paste File Selection, Edit > Copy to Queue, View > Folder Up, View > Focus Phone Pane, View > Focus Mac Pane, View > List/Grid View, View > Show/Hide Hidden Files, View > Light/Dark/System Appearance, File/Help > Open Log, and File > Retry Phone Connection trigger the same active-pane actions as the toolbar or shortcuts.
 - Use the title-bar appearance control to switch between light, system, and dark modes; confirm tables, queue cards, dialogs, and connection help remain readable.
-- Choose Help > Check for Updates and confirm the app reports the current version in a native dialog. With a newer test release, confirm a compact Update action appears in the title bar and opens only the matching project release page. With the network disabled, confirm the manual dialog gives a short offline error while the daily automatic check stays silent.
+- Install the signed app in Applications. Choose Help > Check for Updates and confirm it reports the current version. With a newer test release, confirm the compact Update action appears, no ZIP downloads before it is clicked, and clicking it downloads the matching architecture. Confirm Restart to update appears only after the download completes, ordinary quit does not install the update, and an explicit restart launches the new version. During an active transfer or phone mutation, confirm restart is refused until work finishes. With the network disabled, confirm the manual check gives a short offline error while the daily automatic check stays silent. Also confirm an app launched from a mounted DMG, Downloads, a translocated path, or an unwritable location offers View Release with an explanation instead of an in-place update.
 - Change the phone pane to grid while leaving the Mac pane in list view, relaunch, and confirm each pane remembers its own view mode.
 - Use each pane's hidden files toolbar button independently; confirm dotfiles and dotfolders are hidden by default, changing the phone does not reload the Mac folder, and both settings survive relaunch. Confirm the View menu applies to the currently focused pane.
 - Opening `DCIM` or `Movies` shows files in rows, not oversized cards.

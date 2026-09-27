@@ -70,7 +70,7 @@ jobs:
     env:
       CI: "true"
       TARGET_ARCH: ${{ matrix.arch }}
-      MACOSX_DEPLOYMENT_TARGET: "12.0"
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
       NATIVE_DEPS_PREFIX: ${{ github.workspace }}/.native-deps/${{ matrix.arch }}
       SIGNING_IDENTITY: ${{ inputs.signing_identity }}
       CSC_CERTIFICATE_NAME: ${{ inputs.csc_certificate_name }}
@@ -119,17 +119,14 @@ jobs:
           echo "RELEASE_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
       - run: npm run check:public-source
       - run: npm audit --omit=dev --audit-level=high
-      - name: Build, sign, notarize, and verify DMG
+      - name: Build, sign, notarize, and verify DMG and update ZIP
         run: npm run release:mac -- ${{ matrix.arch }}
-      - name: Smoke test packaged helper and native app launch
-        run: |
-          APP_PATH="$(find "release/${{ matrix.arch }}" -maxdepth 3 -type d -name 'Android File Transfer for macOS.app' -print -quit)"
-          test -n "$APP_PATH"
-          bash scripts/smoke-packaged-app.sh "$APP_PATH" "${{ matrix.arch }}"
       - uses: actions/upload-artifact@v4
         with:
-          name: signed-dmg-${{ matrix.arch }}
-          path: release/assets/Android-File-Transfer-for-macOS-${{ needs.prepare.outputs.version }}-${{ matrix.arch }}.dmg
+          name: signed-macos-${{ matrix.arch }}
+          path: |
+            release/assets/Android-File-Transfer-for-macOS-${{ needs.prepare.outputs.version }}-${{ matrix.arch }}.dmg
+            release/assets/Android-File-Transfer-for-macOS-${{ needs.prepare.outputs.version }}-${{ matrix.arch }}.zip
           if-no-files-found: error
       - name: Remove temporary signing keychain
         if: always()
@@ -158,64 +155,13 @@ jobs:
           node-version: 22.12.0
           cache: npm
       - run: npm ci
+      - run: node scripts/check-update-manifest.mjs
       - uses: actions/download-artifact@v4
         with:
-          pattern: signed-dmg-*
+          pattern: signed-macos-*
           path: release/assets
           merge-multiple: true
-      - run: npm run release:sources -- "$VERSION"
-      - run: bash scripts/create-checksums.sh release/assets
-      - name: Verify collected artifacts
-        run: |
-          set -euo pipefail
-          expected_assets="$(printf '%s\n' \
-            "Android-File-Transfer-for-macOS-$VERSION-arm64.dmg" \
-            "Android-File-Transfer-for-macOS-$VERSION-x64.dmg" \
-            "THIRD_PARTY_SOURCES-$VERSION.tar.gz" \
-            'SHA256SUMS.txt' | LC_ALL=C sort)"
-          actual_assets="$(find release/assets -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort)"
-          if [[ "$actual_assets" != "$expected_assets" ]]; then
-            diff -u <(printf '%s\n' "$expected_assets") <(printf '%s\n' "$actual_assets") || true
-            exit 1
-          fi
-          test -z "$(find release/assets -mindepth 1 -maxdepth 1 ! -type f -print -quit)"
-          bash scripts/verify-macos-release.sh "release/assets/Android-File-Transfer-for-macOS-$VERSION-arm64.dmg" arm64 "$VERSION"
-          bash scripts/verify-macos-release.sh "release/assets/Android-File-Transfer-for-macOS-$VERSION-x64.dmg" x64 "$VERSION"
-          (cd release/assets && shasum -a 256 -c SHA256SUMS.txt)
-      - name: Create or update draft release
-        run: |
-          set -euo pipefail
-          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
-            git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
-            test "$(git rev-list -n 1 "$TAG")" = "$SOURCE_SHA"
-          fi
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            test "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = "true"
-            gh release upload "$TAG" release/assets/* --clobber
-          else
-            gh release create "$TAG" release/assets/* --draft --prerelease --target "$SOURCE_SHA" --title "$TAG" --generate-notes
-          fi
-          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
-          test "$(git rev-list -n 1 "$TAG")" = "$SOURCE_SHA"
-      - name: Download and independently reverify release assets
-        run: |
-          set -euo pipefail
-          rm -rf .tmp/release-download
-          mkdir -p .tmp/release-download
-          gh release download "$TAG" --dir .tmp/release-download
-          expected_assets="$(printf '%s\n' \
-            "Android-File-Transfer-for-macOS-$VERSION-arm64.dmg" \
-            "Android-File-Transfer-for-macOS-$VERSION-x64.dmg" \
-            "THIRD_PARTY_SOURCES-$VERSION.tar.gz" \
-            'SHA256SUMS.txt' | LC_ALL=C sort)"
-          actual_assets="$(find .tmp/release-download -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort)"
-          if [[ "$actual_assets" != "$expected_assets" ]]; then
-            diff -u <(printf '%s\n' "$expected_assets") <(printf '%s\n' "$actual_assets") || true
-            exit 1
-          fi
-          test -z "$(find .tmp/release-download -mindepth 1 -maxdepth 1 ! -type f -print -quit)"
-          (cd .tmp/release-download && shasum -a 256 -c SHA256SUMS.txt)
-          bash scripts/verify-macos-release.sh ".tmp/release-download/Android-File-Transfer-for-macOS-$VERSION-arm64.dmg" arm64 "$VERSION"
-          bash scripts/verify-macos-release.sh ".tmp/release-download/Android-File-Transfer-for-macOS-$VERSION-x64.dmg" x64 "$VERSION"
-      - name: Publish as a pre-release
-        run: gh release edit "$TAG" --draft=false --prerelease=true
+      - name: Prepare manifest, sources, checksums, and verify collected artifacts
+        run: bash scripts/prepare-release-assets.sh release/assets "$VERSION"
+      - name: Upload draft, re-download and verify, then publish stable release
+        run: bash scripts/publish-macos-release.sh release/assets "$VERSION"

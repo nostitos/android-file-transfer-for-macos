@@ -3,6 +3,7 @@ set -euo pipefail
 
 APP_PATH="${1:?Usage: smoke-packaged-app.sh APP_PATH arm64|x64}"
 ARCH="${2:?Usage: smoke-packaged-app.sh APP_PATH arm64|x64}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PRODUCT_NAME="Android File Transfer for macOS"
 EXPECTED_HOST=""
 
@@ -28,6 +29,11 @@ APP_PID=""
 cleanup() {
   if [[ -n "$APP_PID" ]] && kill -0 "$APP_PID" >/dev/null 2>&1; then
     kill -TERM "$APP_PID" >/dev/null 2>&1 || true
+    for _ in {1..20}; do
+      if ! kill -0 "$APP_PID" >/dev/null 2>&1; then break; fi
+      sleep 0.1
+    done
+    kill -KILL "$APP_PID" >/dev/null 2>&1 || true
     wait "$APP_PID" >/dev/null 2>&1 || true
   fi
   rm -f "$STATUS_FILE"
@@ -35,7 +41,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$HELPER" status > "$STATUS_FILE"
+node "$ROOT/scripts/run-release-command.mjs" 20 "$HELPER" status > "$STATUS_FILE"
 node -e '
   const fs = require("node:fs");
   const line = fs.readFileSync(process.argv[1], "utf8")
@@ -48,7 +54,7 @@ node -e '
   }
 ' "$STATUS_FILE"
 
-if ! "$EXECUTABLE" --disable-gpu --file-promise-smoke > "$LOG_DIR/addon-stdout.log" 2> "$LOG_DIR/addon-stderr.log"; then
+if ! node "$ROOT/scripts/run-release-command.mjs" 30 "$EXECUTABLE" --disable-gpu --file-promise-smoke > "$LOG_DIR/addon-stdout.log" 2> "$LOG_DIR/addon-stderr.log"; then
   echo "Packaged file-promise addon failed to load in the signed Electron host." >&2
   sed -n '1,80p' "$LOG_DIR/addon-stderr.log" >&2
   exit 1

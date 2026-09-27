@@ -6,7 +6,6 @@ import {
   ipcMain,
   Menu,
   nativeImage,
-  net,
   screen,
   shell,
   type MessageBoxOptions,
@@ -37,6 +36,7 @@ import { access, constants } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import electronUpdater from 'electron-updater';
 import { androidUsbFallbackKey, parseAndroidUsbDevicesFromIoreg } from './androidUsb';
 import { findMacMtpCameraOwner, findMacCameraClients, cameraProcessAgeSeconds, MacCameraConflicts, type MacMtpCameraOwner, type MacCameraConflictSnapshot } from './macMtpCamera';
 import {
@@ -58,7 +58,7 @@ import {
 } from '../shared/deviceIdentity';
 import { encodePhoneCommandName, validatePhoneItemName } from '../shared/phoneMutation';
 import { validateLocalItemName } from '../shared/localMutation';
-import { normalizeSemanticVersion, selectLatestRelease, type ReleaseCandidate } from '../shared/appUpdate';
+import { classifyUpdateInstallLocation, normalizeSemanticVersion } from '../shared/appUpdate';
 import { keepBothPhoneName, temporaryPhoneTransferName } from '../shared/transferCollision';
 import type {
   AppMenuCommand,
@@ -109,6 +109,7 @@ import type {
   UploadRequest
 } from '../shared/types';
 
+const { autoUpdater } = electronUpdater;
 const currentDir = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const APP_NAME = 'Android File Transfer for macOS';
@@ -127,12 +128,8 @@ const TRANSFER_COMMAND_IDLE_TIMEOUT_MS = 30 * 60_000;
 const MAX_PROMISED_PHONE_FILES = 20_000;
 const MAX_PHONE_MUTATION_ITEMS = 1_000;
 const MAX_PROMISED_PHONE_FOLDERS = 5_000;
-const GITHUB_RELEASES_API =
-  'https://api.github.com/repos/nostitos/android-file-transfer-for-macos/releases?per_page=20';
 const GITHUB_RELEASES_WEB =
   'https://github.com/nostitos/android-file-transfer-for-macos/releases/tag/';
-const UPDATE_CHECK_TIMEOUT_MS = 12_000;
-const UPDATE_RESPONSE_MAX_BYTES = 512 * 1024;
 let mainWindow: BrowserWindow | null = null;
 const transferJobs = new Map<string, TransferJob>();
 let activeJobId: string | null = null;
@@ -141,6 +138,18 @@ let pendingPromisePlanningCount = 0;
 let phoneMutationInProgress = false;
 let localMutationInProgress = false;
 let updateCheckInFlight: Promise<AppUpdateCheckResult> | null = null;
+let updateDownloadInFlight: Promise<AppUpdateCheckResult> | null = null;
+let appUpdateStatus: AppUpdateCheckResult = {
+  ok: true,
+  status: 'idle',
+  currentVersion: app.getVersion(),
+  checkedAt: '',
+  message: 'Updates have not been checked yet.'
+};
+
+autoUpdater.autoDownload = false;
+autoUpdater.autoInstallOnAppQuit = false;
+autoUpdater.logger = null;
 
 app.setName(APP_NAME);
 
@@ -1851,102 +1860,121 @@ async function copyDiagnostics(): Promise<DiagnosticsCopyResult> {
   }
 }
 
-async function readBoundedResponseText(response: Response): Promise<string> {
-  const declaredLength = Number(response.headers.get('content-length'));
-  if (Number.isFinite(declaredLength) && declaredLength > UPDATE_RESPONSE_MAX_BYTES) {
-    throw new Error('GitHub returned an unexpectedly large update response.');
+function publishAppUpdateStatus(status: AppUpdateCheckResult): AppUpdateCheckResult {
+  appUpdateStatus = status;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('app:update-status', status);
   }
-  if (!response.body) {
-    return '';
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let total = 0;
-  let text = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
-    total += value.byteLength;
-    if (total > UPDATE_RESPONSE_MAX_BYTES) {
-      await reader.cancel();
-      throw new Error('GitHub returned an unexpectedly large update response.');
-    }
-    text += decoder.decode(value, { stream: true });
-  }
-  return text + decoder.decode();
+  return status;
 }
+
+async function updateInstallBlockReason(): Promise<string | null> {
+  if (process.platform !== 'darwin' || !app.isPackaged) {
+    return 'In-app updates are available in the installed macOS app.';
+  }
+  const location = classifyUpdateInstallLocation(process.execPath, app.getPath('downloads'));
+  if (location.reason || !location.appBundlePath) {
+    return location.reason;
+  }
+  try {
+    await access(location.appBundlePath, constants.W_OK);
+    await access(dirname(location.appBundlePath), constants.W_OK);
+    return null;
+  } catch {
+    return 'This app location is not writable. Move the app to Applications, or download the new version from GitHub.';
+  }
+}
+
+autoUpdater.on('error', (error) => {
+  appendLog(`update service error: ${error.message}`);
+  publishAppUpdateStatus({
+    ...appUpdateStatus,
+    ok: false,
+    status: 'error',
+    message: 'The update could not be completed. Try again or download the release from GitHub.'
+  });
+});
+
+autoUpdater.on('download-progress', (progress) => {
+  if (appUpdateStatus.status !== 'downloading') {
+    return;
+  }
+  publishAppUpdateStatus({
+    ...appUpdateStatus,
+    downloadPercent: Math.max(0, Math.min(100, progress.percent)),
+    message: `Downloading version ${appUpdateStatus.latestVersion ?? ''}...`
+  });
+});
+
+autoUpdater.on('update-downloaded', (event) => {
+  appendLog(`update downloaded: ${event.version}`);
+  publishAppUpdateStatus({
+    ...appUpdateStatus,
+    ok: true,
+    status: 'ready-to-install',
+    latestVersion: event.version,
+    releaseTag: `v${event.version}`,
+    downloadPercent: 100,
+    message: `Version ${event.version} is ready. Restart to install it.`
+  });
+});
 
 async function fetchAppUpdateResult(): Promise<AppUpdateCheckResult> {
   const checkedAt = new Date().toISOString();
   const currentVersion = app.getVersion();
-  if (!net.isOnline()) {
-    return {
+  publishAppUpdateStatus({
+    ok: true,
+    status: 'checking',
+    currentVersion,
+    checkedAt,
+    message: 'Checking for updates...'
+  });
+  if (!app.isPackaged) {
+    return publishAppUpdateStatus({
       ok: false,
       status: 'error',
       currentVersion,
       checkedAt,
-      message: 'The Mac appears to be offline. Connect to the internet and try again.'
-    };
-  }
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), UPDATE_CHECK_TIMEOUT_MS);
-  try {
-    const response = await net.fetch(GITHUB_RELEASES_API, {
-      cache: 'no-store',
-      headers: {
-        Accept: 'application/vnd.github+json',
-        'User-Agent': `Android-File-Transfer-for-macOS/${currentVersion}`,
-        'X-GitHub-Api-Version': '2022-11-28'
-      },
-      signal: controller.signal
+      message: 'Update checks are available in the installed app.'
     });
-    if (!response.ok) {
-      throw new Error(`GitHub release service returned HTTP ${response.status}.`);
+  }
+  try {
+    const result = await autoUpdater.checkForUpdates();
+    if (!result) {
+      throw new Error('The update service did not return a result.');
     }
-    const body = await readBoundedResponseText(response);
-    const parsed = JSON.parse(body) as unknown;
-    if (!Array.isArray(parsed)) {
-      throw new Error('GitHub returned an invalid release list.');
-    }
-    const selected = selectLatestRelease(currentVersion, parsed as ReleaseCandidate[]);
-    if (!selected) {
+    if (!result.isUpdateAvailable) {
       appendLog(`update check complete: ${currentVersion} is current`);
-      return {
+      return publishAppUpdateStatus({
         ok: true,
         status: 'up-to-date',
         currentVersion,
         checkedAt,
         message: `Version ${currentVersion} is up to date.`
-      };
+      });
     }
-    appendLog(`update available: ${currentVersion} -> ${selected.version}`);
-    return {
+    const latestVersion = result.updateInfo.version;
+    const blockReason = await updateInstallBlockReason();
+    appendLog(`update available: ${currentVersion} -> ${latestVersion}`);
+    return publishAppUpdateStatus({
       ok: true,
       status: 'update-available',
       currentVersion,
-      latestVersion: selected.version,
-      releaseTag: selected.tag,
+      latestVersion,
+      releaseTag: `v${latestVersion}`,
       checkedAt,
-      message: `Version ${selected.version} is available.`
-    };
+      canInstallInPlace: blockReason === null,
+      message: blockReason ?? `Version ${latestVersion} is available to download.`
+    });
   } catch (error) {
-    const aborted = controller.signal.aborted;
     appendLog(`update check failed: ${error instanceof Error ? error.message : String(error)}`);
-    return {
+    return publishAppUpdateStatus({
       ok: false,
       status: 'error',
       currentVersion,
       checkedAt,
-      message: aborted
-        ? 'The update check took too long. Try again.'
-        : 'Could not reach the GitHub release service. Try again later.'
-    };
-  } finally {
-    clearTimeout(timeout);
+      message: 'Could not reach the GitHub update service. Try again later.'
+    });
   }
 }
 
@@ -1954,10 +1982,98 @@ function getAppUpdateResult(): Promise<AppUpdateCheckResult> {
   if (updateCheckInFlight) {
     return updateCheckInFlight;
   }
+  if (appUpdateStatus.status === 'downloading' || appUpdateStatus.status === 'ready-to-install') {
+    return Promise.resolve(appUpdateStatus);
+  }
   updateCheckInFlight = fetchAppUpdateResult().finally(() => {
     updateCheckInFlight = null;
   });
   return updateCheckInFlight;
+}
+
+async function downloadAppUpdate(): Promise<AppUpdateCheckResult> {
+  if (updateDownloadInFlight) {
+    return updateDownloadInFlight;
+  }
+  if (appUpdateStatus.status !== 'update-available' || !appUpdateStatus.latestVersion) {
+    return appUpdateStatus;
+  }
+  const blockReason = await updateInstallBlockReason();
+  if (blockReason) {
+    return publishAppUpdateStatus({
+      ...appUpdateStatus,
+      canInstallInPlace: false,
+      message: blockReason
+    });
+  }
+  publishAppUpdateStatus({
+    ...appUpdateStatus,
+    status: 'downloading',
+    downloadPercent: 0,
+    message: `Downloading version ${appUpdateStatus.latestVersion}...`
+  });
+  updateDownloadInFlight = autoUpdater.downloadUpdate()
+    .then(() => appUpdateStatus)
+    .catch((error: unknown) => {
+      appendLog(`update download failed: ${error instanceof Error ? error.message : String(error)}`);
+      return publishAppUpdateStatus({
+        ...appUpdateStatus,
+        ok: false,
+        status: 'error',
+        message: 'The update download failed. Check your connection and try again, or use the GitHub release.'
+      });
+    })
+    .finally(() => {
+      updateDownloadInFlight = null;
+    });
+  return updateDownloadInFlight;
+}
+
+function hasUnfinishedFileWork(): boolean {
+  return Boolean(
+    activeJobId ||
+    [...transferJobs.values()].some((job) => job.status === 'active' || job.status === 'queued') ||
+    phoneMutationInProgress ||
+    localMutationInProgress ||
+    pendingPromisePlanningCount > 0 ||
+    promiseFulfillments.size > 0
+  );
+}
+
+async function installAppUpdate(): Promise<OpenUpdateReleaseResult> {
+  if (appUpdateStatus.status !== 'ready-to-install') {
+    return { ok: false, message: 'Download the update before restarting to install it.' };
+  }
+  const blockReason = await updateInstallBlockReason();
+  if (blockReason) {
+    return { ok: false, message: blockReason };
+  }
+  if (hasUnfinishedFileWork()) {
+    return { ok: false, message: 'Finish current file transfers before restarting to install the update.' };
+  }
+  appendLog(`user requested install of version ${appUpdateStatus.latestVersion}`);
+  setTimeout(() => {
+    if (hasUnfinishedFileWork()) {
+      appendLog('update restart canceled because a file operation started');
+      publishAppUpdateStatus({
+        ...appUpdateStatus,
+        message: 'Finish current file transfers before restarting to install the update.'
+      });
+      return;
+    }
+    try {
+      autoUpdater.quitAndInstall();
+    } catch (error) {
+      appendLog(`update restart failed: ${error instanceof Error ? error.message : String(error)}`);
+      publishAppUpdateStatus({
+        ...appUpdateStatus,
+        ok: false,
+        status: 'error',
+        message: 'Could not restart to install the update. Try again or use the GitHub release.'
+      });
+    }
+  }, 50);
+  return { ok: true, message: 'Restarting to install the update.' };
 }
 
 async function showUpdateCheckDialog(result: AppUpdateCheckResult): Promise<void> {
@@ -1967,8 +2083,18 @@ async function showUpdateCheckDialog(result: AppUpdateCheckResult): Promise<void
       type: 'info',
       title: 'Update Available',
       message: `Version ${result.latestVersion} is available.`,
-      detail: `You are using version ${result.currentVersion}. GitHub will show the signed downloads and release notes.`,
-      buttons: ['View Release', 'Later'],
+      detail: result.message,
+      buttons: result.canInstallInPlace ? ['Download Update', 'View Release', 'Later'] : ['View Release', 'Later'],
+      defaultId: 0,
+      cancelId: result.canInstallInPlace ? 2 : 1,
+      noLink: true
+    };
+  } else if (result.status === 'ready-to-install') {
+    options = {
+      type: 'info',
+      title: 'Update Ready',
+      message: result.message,
+      buttons: ['Restart and Install', 'Later'],
       defaultId: 0,
       cancelId: 1,
       noLink: true
@@ -1986,22 +2112,35 @@ async function showUpdateCheckDialog(result: AppUpdateCheckResult): Promise<void
     };
   } else {
     options = {
-      type: 'warning',
-      title: 'Update Check Failed',
-      message: 'Could not check for updates.',
-      detail: result.message,
+      type: result.status === 'error' ? 'warning' : 'info',
+      title: result.status === 'error' ? 'Update Check Failed' : 'Update in Progress',
+      message: result.message,
       buttons: ['OK'],
       defaultId: 0,
       cancelId: 0,
       noLink: true
     };
   }
-
   const response = mainWindow && !mainWindow.isDestroyed()
     ? await dialog.showMessageBox(mainWindow, options)
     : await dialog.showMessageBox(options);
-  if (response.response === 0 && result.status === 'update-available' && result.releaseTag) {
-    await openUpdateRelease(result.releaseTag);
+  if (response.response !== 0) {
+    if (response.response === 1 && result.status === 'update-available' && result.canInstallInPlace && result.releaseTag) {
+      await openUpdateRelease(result.releaseTag);
+    }
+    return;
+  }
+  if (result.status === 'update-available' && result.releaseTag) {
+    if (result.canInstallInPlace) {
+      void downloadAppUpdate();
+    } else {
+      await openUpdateRelease(result.releaseTag);
+    }
+  } else if (result.status === 'ready-to-install') {
+    const install = await installAppUpdate();
+    if (!install.ok) {
+      await dialog.showMessageBox({ type: 'warning', message: install.message, buttons: ['OK'] });
+    }
   }
 }
 
@@ -4837,9 +4976,12 @@ app.whenReady().then(() => {
     await shell.openPath(getLogPath());
   });
   ipcMain.handle('mtp:copyDiagnostics', copyDiagnostics);
+  ipcMain.handle('app:getUpdateStatus', () => appUpdateStatus);
   ipcMain.handle('app:checkForUpdates', (_event, interactive?: boolean) =>
     checkForAppUpdates(interactive === true)
   );
+  ipcMain.handle('app:downloadUpdate', downloadAppUpdate);
+  ipcMain.handle('app:installUpdate', installAppUpdate);
   ipcMain.handle('app:openUpdateRelease', (_event, releaseTag: string) =>
     openUpdateRelease(releaseTag)
   );

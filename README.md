@@ -6,13 +6,13 @@ This is basic device interoperability. It should be built into macOS. Until it i
 
 ![Android File Transfer for macOS project graphic](docs/project-graphic.png)
 
-> **Early public release:** v0.2.0 is available for testing across more Android devices and Mac configurations. Please report the phone model, macOS version, and the app's privacy-bounded Copy Report when something does not work.
+> **Early public release:** v0.2.0 is available for testing across more Android devices and Mac configurations. Please report the phone model, Android and macOS versions, and the app's privacy-bounded Copy Report when something does not work.
 
 ![Android File Transfer for macOS showing the phone and Mac file panes](docs/screenshot.png)
 
 ## Download
 
-Download the DMG for your Mac from [GitHub Releases](https://github.com/nostitos/android-file-transfer-for-macos/releases):
+Download the DMG for your Mac from the [latest GitHub release](https://github.com/nostitos/android-file-transfer-for-macos/releases/latest):
 
 - `arm64` for Apple silicon Macs
 - `x64` for Intel Macs
@@ -38,7 +38,7 @@ Both the app and DMG are signed with an Apple Developer ID, notarized by Apple, 
 - Show or hide hidden files independently in each pane; hidden files stay hidden by default.
 - Recursive copies show Preparing folder copy feedback and a Stop action before any transfer jobs are queued.
 - Keeps routine polling and empty keyboard actions quiet.
-- Checks the project's GitHub Releases at most once per day and shows a compact Update action only when a newer version exists; Help > Check for Updates gives an immediate result.
+- Checks the project's published update metadata at most once per day and shows an Update action only when a newer version exists; Help > Check for Updates gives an immediate result. Download and restart require separate, explicit actions.
 - Shows USB detection, File Transfer mode, file-session state, storage, and folder loading as separate stages.
 - Automatically opens one MTP session when File Transfer appears and reuses it for browsing and copying.
 - Gives distinct guidance for a locked phone or Android Allow prompt.
@@ -48,15 +48,17 @@ Phone rename and permanent delete verify the selected object's ID, storage, pare
 
 ## Requirements
 
-- macOS 12 Monterey or newer
+- macOS 13 Ventura or newer
 - Apple silicon or Intel Mac
 - Android device connected by USB with **File Transfer**, **Transferring files**, or **MTP** selected
 
 No Homebrew installation is needed for the downloaded app. The DMGs include pinned libmtp and libusb libraries.
 
+The [real-device checklist](docs/manual-test-checklist.md) covers Samsung Galaxy S24-class and Pixel 9 USB scenarios. A per-model compatibility matrix will be published as complete browse, copy, rename, delete, and Replace runs are recorded; that acceptance testing is still in progress.
+
 ## Use
 
-1. Install the DMG matching your Mac and drag the app to Applications.
+1. Open the DMG matching your Mac and drag the app to Applications. In-app updates require an installed copy.
 2. Connect and unlock the Android device.
 3. Choose File Transfer from the Android USB notification and approve Android's data-access prompt if it appears. The app detects the mode change and opens the phone automatically.
 4. Wait for the storage list, then browse the phone and Mac panes, select files or folders, and use the directional Copy controls or drag and drop.
@@ -66,7 +68,7 @@ USB visibility does not mean the phone has answered the file request yet. Each o
 ## Privacy and security
 
 - No analytics, telemetry, advertising, account, or network file transfer.
-- Update checks contact only this project's public GitHub Releases API and send the app version in the standard request identifier; no phone or file information is included.
+- Update checks request this project's published GitHub Releases update manifest. GitHub receives ordinary HTTPS connection metadata; the app sends no phone details, file names, or file contents. The update ZIP is downloaded only after you choose Update, and installation requires a separate restart choice.
 - File transfers stay between the connected Android device and the Mac.
 - Copy Report excludes phone file listings and contains bounded connection diagnostics only.
 - Release builds use hardened runtime, Developer ID signing, Apple notarization, and Gatekeeper verification.
@@ -86,7 +88,7 @@ npm run check
 npm run dev
 ```
 
-The native dependency script downloads libusb 1.0.30 and libmtp 1.1.23 from their upstream release locations, verifies pinned SHA-256 checksums, and compiles them with a macOS 12 deployment target. Development builds are ad-hoc signed; public releases require the Developer ID and notarization workflow in `.github/workflows/release.yml`.
+The native dependency script downloads libusb 1.0.30 and libmtp 1.1.23 from their upstream release locations, verifies pinned SHA-256 checksums, and compiles them with a macOS 13 deployment target. Development builds are ad-hoc signed; public releases require the Developer ID and notarization workflow in `.github/workflows/release.yml`.
 
 Useful checks:
 
