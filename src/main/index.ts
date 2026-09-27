@@ -36,7 +36,7 @@ import { access, constants } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { autoUpdater } from 'electron-updater';
+import electronUpdater from 'electron-updater';
 import { androidUsbFallbackKey, parseAndroidUsbDevicesFromIoreg } from './androidUsb';
 import { findMacMtpCameraOwner, findMacCameraClients, cameraProcessAgeSeconds, MacCameraConflicts, type MacMtpCameraOwner, type MacCameraConflictSnapshot } from './macMtpCamera';
 import {
@@ -109,6 +109,7 @@ import type {
   UploadRequest
 } from '../shared/types';
 
+const { autoUpdater } = electronUpdater;
 const currentDir = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const APP_NAME = 'Android File Transfer for macOS';
